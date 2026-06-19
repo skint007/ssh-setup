@@ -1,0 +1,8 @@
+# makepkg build artifacts (from a local `cd aur && makepkg` run)
+/aur/src/
+/aur/pkg/
+/aur/*.pkg.tar.zst
+/aur/*.tar.gz
+/aur/.SRCINFO
+# makepkg's bare git source clone (named after the source: git+...ssh-setup.git)
+/aur/ssh-setup/
