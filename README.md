@@ -40,7 +40,8 @@ Only `--host` is required; everything else has a sensible default.
 | Option | Description | Default |
 | --- | --- | --- |
 | `-h`, `--host` | Target hostname or IP address **(required)** | — |
-| `-u`, `--user` | Username for the SSH connection | current user (`whoami`) |
+| `-u`, `--user` | Username for the SSH connection | the local user |
+| `--local-user` | Local account to install the key and config for (see [Installing for another user](#installing-for-another-user)) | the user running the script |
 | `-p`, `--port` | SSH port | `22` |
 | `-n`, `--name` | Key name identifier (used in the key filename) | the host |
 | `-c`, `--comment` | Comment embedded in the SSH key | `user@localhost_to_host` |
@@ -69,7 +70,35 @@ Only `--host` is required; everything else has a sensible default.
 
 # Rotate the key for an existing entry
 ./ssh-setup.sh --rotate --alias homeserver
+
+# As root, set up SSH access for skint007 instead of root
+sudo ./ssh-setup.sh --host example.com --local-user skint007
 ```
+
+## Installing for another user
+
+Sometimes the account you're logged in as isn't the account that should own the
+key — e.g. you're provisioning a machine as `root` but want SSH access set up
+for `skint007`. Pass `--local-user`:
+
+```bash
+sudo ./ssh-setup.sh --host example.com --local-user skint007
+```
+
+With `--local-user <name>`:
+
+- The key pair, `config` entry, and config backups are created under **that
+  user's** `~/.ssh` (resolved via `getent`), and everything the script creates
+  is `chown`ed to them.
+- The remote username (`--user`) defaults to the local user, not to `root`.
+- Host keys are recorded in that user's `~/.ssh/known_hosts`, so their first
+  `ssh <alias>` won't hit a host-key prompt the script already answered.
+- `--rotate` works the same way: `sudo ./ssh-setup.sh --rotate --alias
+  homeserver --local-user skint007` rotates the entry in that user's config.
+
+Running with a `--local-user` other than yourself requires root (it has to
+write into their home and change ownership). Without the flag, behavior is
+unchanged — everything happens in your own `~/.ssh`.
 
 ## Rotating a key
 
