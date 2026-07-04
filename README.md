@@ -85,20 +85,24 @@ for `skint007`. Pass `--local-user`:
 sudo ./ssh-setup.sh --host example.com --local-user skint007
 ```
 
-With `--local-user <name>`:
+With `--local-user <name>`, the script **re-execs itself as that user** (via
+`runuser`) after checking you're root and the account exists. Everything after
+that point runs as the target user, so:
 
-- The key pair, `config` entry, and config backups are created under **that
-  user's** `~/.ssh` (resolved via `getent`), and everything the script creates
-  is `chown`ed to them.
+- The key pair, `config` entry, and config backups land in **that user's**
+  `~/.ssh` and are owned by them — no `chown` step, nothing left root-owned.
+- `ssh` resolves *their* `~/.ssh/config`, `known_hosts`, identities and agent —
+  the install, verification, and final connection test all use the exact setup
+  they'll use when they later run `ssh <alias>`.
 - The remote username (`--user`) defaults to the local user, not to `root`.
-- Host keys are recorded in that user's `~/.ssh/known_hosts`, so their first
-  `ssh <alias>` won't hit a host-key prompt the script already answered.
 - `--rotate` works the same way: `sudo ./ssh-setup.sh --rotate --alias
   homeserver --local-user skint007` rotates the entry in that user's config.
 
-Running with a `--local-user` other than yourself requires root (it has to
-write into their home and change ownership). Without the flag, behavior is
-unchanged — everything happens in your own `~/.ssh`.
+Running with a `--local-user` other than yourself requires root and
+`runuser` (part of `util-linux`, present on essentially all Linux systems).
+The target user must be able to read the script file, since it is re-run as
+them. Without the flag, behavior is unchanged — everything happens in your own
+`~/.ssh` with no re-exec.
 
 ## Rotating a key
 

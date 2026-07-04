@@ -4,7 +4,8 @@
 # Setup:  generate a new SSH key, copy it to a server, and update ~/.ssh/config.
 # Rotate: replace the key of an existing ~/.ssh/config entry with a fresh one.
 # With --local-user, run as root but install the key/config for another local
-# account (e.g. sudo ssh-setup.sh --host x --local-user skint007).
+# account (e.g. sudo ssh-setup.sh --host x --local-user skint007): the script
+# re-execs itself as that user, so ssh and every file it writes act as them.
 
 set -euo pipefail
 
@@ -35,13 +36,6 @@ print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-# When installing on behalf of another user (--local-user as root), hand
-# ownership of files this script creates over to that user. No-op otherwise.
-fix_owner() {
-    [[ "$LOCAL_USER" != "$CURRENT_USER" ]] || return 0
-    chown "$LOCAL_USER:" "$@"
-}
-
 # Function to show usage
 usage() {
     cat << EOF
@@ -56,7 +50,8 @@ OPTIONS:
     -u, --user          Username for SSH connection (default: the local user)
     --local-user        Local account to install the key and SSH config for
                         (default: the user running the script). Run as root to
-                        install for another user, e.g. --local-user skint007.
+                        install for another user, e.g. --local-user skint007;
+                        the script re-execs itself as that user.
     -p, --port          SSH port (default: 22)
     -n, --name          Key name identifier (default: hostname)
     -c, --comment       Comment for the SSH key (default: user@hostname)
@@ -113,7 +108,6 @@ backup_config() {
     local backup
     backup="$SSH_CONFIG.backup.$(date +%Y%m%d_%H%M%S)"
     cp "$SSH_CONFIG" "$backup"
-    fix_owner "$backup"
     print_info "Backup of SSH config created: $backup"
 }
 
@@ -137,10 +131,10 @@ do_rotate() {
     fi
 
     hostname=$(config_get "$target" HostName); hostname="${hostname:-$target}"
-    user=$(config_get "$target" User);         user="${user:-$LOCAL_USER}"
+    user=$(config_get "$target" User);         user="${user:-$CURRENT_USER}"
     port=$(config_get "$target" Port);         port="${port:-22}"
     old_key=$(config_get "$target" IdentityFile)
-    old_key="${old_key/#\~/$LOCAL_HOME}"
+    old_key="${old_key/#\~/$HOME}"
 
     if [[ -z "$old_key" ]]; then
         print_error "Entry '$target' has no IdentityFile; cannot determine the key to rotate."
@@ -156,7 +150,7 @@ do_rotate() {
     if [[ ! -f "$old_pub" && -f "$old_key" ]]; then
         print_info "Public key missing; deriving it from the private key."
         ssh-keygen -y -f "$old_key" > "$old_pub" 2>/dev/null || true
-        if [[ -f "$old_pub" ]]; then chmod 644 "$old_pub"; fix_owner "$old_pub"; fi
+        [[ -f "$old_pub" ]] && chmod 644 "$old_pub"
     fi
 
     if [[ -f "$old_pub" ]]; then
@@ -205,15 +199,15 @@ do_rotate() {
     # Install the new public key, preferring the old key for non-interactive auth
     print_info "Installing new public key on $user@$hostname:$port..."
     installed=false
-    if [[ -f "$old_key" ]] && ssh -i "$old_key" -p "$port" "${SSH_USER_OPTS[@]}" \
+    if [[ -f "$old_key" ]] && ssh -i "$old_key" -p "$port" \
             -o IdentitiesOnly=yes -o BatchMode=yes "$user@$hostname" \
             "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" \
             < "$new_key.pub"; then
         installed=true
     elif command -v ssh-copy-id >/dev/null 2>&1 && \
-            ssh-copy-id -i "$new_key.pub" -p "$port" "${SSH_USER_OPTS[@]}" "$user@$hostname"; then
+            ssh-copy-id -i "$new_key.pub" -p "$port" "$user@$hostname"; then
         installed=true
-    elif ssh -p "$port" "${SSH_USER_OPTS[@]}" "$user@$hostname" \
+    elif ssh -p "$port" "$user@$hostname" \
             "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" \
             < "$new_key.pub"; then
         installed=true
@@ -227,8 +221,8 @@ do_rotate() {
 
     # Verify the new key BEFORE removing the old one, so a failure can't lock us out
     print_info "Verifying the new key works..."
-    if ! ssh -i "$new_key" -p "$port" "${SSH_USER_OPTS[@]}" -o IdentitiesOnly=yes \
-            -o BatchMode=yes -o ConnectTimeout=10 "$user@$hostname" "true" >/dev/null 2>&1; then
+    if ! ssh -i "$new_key" -p "$port" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o ConnectTimeout=10 "$user@$hostname" "true" >/dev/null 2>&1; then
         print_error "The new key did not authenticate. Aborting rotation; the old key is untouched."
         print_warning "An unused public key may have been added to the server; remove it manually if desired."
         rm -f "$new_key" "$new_key.pub"
@@ -247,25 +241,20 @@ do_rotate() {
     mv "$new_key" "$old_key"
     mv "$new_key.pub" "$old_pub"
     chmod 600 "$old_key"; chmod 644 "$old_pub"
-    fix_owner "$old_key" "$old_pub"
 
     # Remove the old public key from the server, authenticating with the new key.
     # Only overwrites authorized_keys when the filtered result is non-empty.
     if [[ -n "$old_blob" ]]; then
         print_info "Removing the old key from the server's authorized_keys..."
         remote_rm="f=\$HOME/.ssh/authorized_keys; if [ -f \"\$f\" ]; then grep -vF '$old_blob' \"\$f\" > \"\$f.tmp\" 2>/dev/null || true; if [ -s \"\$f.tmp\" ]; then mv \"\$f.tmp\" \"\$f\"; chmod 600 \"\$f\"; else rm -f \"\$f.tmp\"; fi; fi"
-        if ssh -i "$old_key" -p "$port" "${SSH_USER_OPTS[@]}" -o IdentitiesOnly=yes \
-                -o BatchMode=yes "$user@$hostname" "$remote_rm"; then
+        if ssh -i "$old_key" -p "$port" -o IdentitiesOnly=yes -o BatchMode=yes \
+                "$user@$hostname" "$remote_rm"; then
             print_success "Old key removed from the server."
         else
             print_warning "Could not remove the old key automatically. On the server, delete the"
             print_warning "authorized_keys line containing this key:"
             echo "  $old_blob"
         fi
-    fi
-
-    if [[ -f "$SSH_DIR/known_hosts" ]]; then
-        fix_owner "$SSH_DIR/known_hosts"
     fi
 
     echo
@@ -278,14 +267,12 @@ do_rotate() {
     echo
     print_info "Connect as usual:"
     echo "  ssh $target"
-    if [[ "$LOCAL_USER" != "$CURRENT_USER" ]]; then
-        print_info "Rotated on behalf of '$LOCAL_USER' ($SSH_DIR); connect as that user."
-    fi
     return 0
 }
 
-# Default values (USER defaults to LOCAL_USER once that is resolved below)
-USER=""
+# Default values (REMOTE_USER defaults to the local user once resolved below)
+REMOTE_USER=""
+REMOTE_USER_SET=false
 PORT=22
 KEY_TYPE="ed25519"
 KEY_BITS=4096
@@ -296,6 +283,10 @@ ALIAS=""
 ROTATE=false
 LOCAL_USER=""
 
+# Keep the original arguments so we can re-exec as the target user unchanged
+# (minus --local-user) when installing on someone else's behalf.
+ORIG_ARGS=("$@")
+
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -304,7 +295,8 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         -u|--user)
-            USER="$2"
+            REMOTE_USER="$2"
+            REMOTE_USER_SET=true
             shift 2
             ;;
         -p|--port)
@@ -351,31 +343,58 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Resolve the local account the key and config are installed for. Installing
-# on behalf of another user (e.g. root setting up SSH for skint007) needs root.
 CURRENT_USER=$(id -un)
 LOCAL_USER="${LOCAL_USER:-$CURRENT_USER}"
-if [[ "$LOCAL_USER" != "$CURRENT_USER" && $EUID -ne 0 ]]; then
-    print_error "Installing for another user ($LOCAL_USER) requires running as root."
-    exit 1
+
+# Installing for a different local account: re-exec the whole script as that
+# user. From there ssh natively resolves their ~/.ssh/config, known_hosts,
+# identities and agent, and every file created is already owned by them — no
+# chown dance and no config/known_hosts path juggling. Requires root.
+if [[ "$LOCAL_USER" != "$CURRENT_USER" ]]; then
+    if [[ $EUID -ne 0 ]]; then
+        print_error "Installing for another user ($LOCAL_USER) requires running as root."
+        exit 1
+    fi
+    if ! id "$LOCAL_USER" >/dev/null 2>&1; then
+        print_error "No such local user: '$LOCAL_USER'"
+        exit 1
+    fi
+    if ! command -v runuser >/dev/null 2>&1; then
+        print_error "runuser (util-linux) is required to install for another user but was not found."
+        exit 1
+    fi
+
+    # Forward the original args, dropping --local-user and its value.
+    FORWARD_ARGS=()
+    skip_next=false
+    for a in "${ORIG_ARGS[@]}"; do
+        if [[ "$skip_next" == true ]]; then skip_next=false; continue; fi
+        if [[ "$a" == "--local-user" ]]; then skip_next=true; continue; fi
+        FORWARD_ARGS+=("$a")
+    done
+
+    # Resolve to an absolute path: $0 is already absolute when run via PATH or a
+    # shebang; make it absolute for ./script or bare relative invocations too.
+    SELF="$0"
+    [[ "$SELF" == /* ]] || SELF="$(pwd)/$SELF"
+
+    print_info "Setting up SSH for '$LOCAL_USER' — re-running as that user..."
+    exec runuser -u "$LOCAL_USER" -- bash "$SELF" "${FORWARD_ARGS[@]}"
 fi
-if ! LOCAL_HOME=$(getent passwd "$LOCAL_USER" | cut -d: -f6) || [[ -z "$LOCAL_HOME" ]]; then
-    print_error "No such local user or no home directory: '$LOCAL_USER'"
-    exit 1
-fi
-if [[ ! -d "$LOCAL_HOME" ]]; then
-    print_error "Home directory of '$LOCAL_USER' does not exist: $LOCAL_HOME"
-    exit 1
-fi
-SSH_DIR="$LOCAL_HOME/.ssh"
+
+# From here on we are running as the account the key/config are installed for,
+# so plain $HOME is that account's home — exactly where ssh will look later.
+SSH_DIR="$HOME/.ssh"
 SSH_CONFIG="$SSH_DIR/config"
 
-# Record host keys in the target user's known_hosts (same file as the default
-# when running as yourself), so first-contact prompts benefit LOCAL_USER, not root.
-SSH_USER_OPTS=(-o "UserKnownHostsFile=$SSH_DIR/known_hosts")
-
-# Remote user defaults to the account we install for, not the caller (root)
-USER="${USER:-$LOCAL_USER}"
+# The remote username defaults to the local account. An explicitly-empty
+# --user "" is a misconfiguration (e.g. an unset automation variable), so fail
+# loudly instead of silently substituting a default.
+if [[ "$REMOTE_USER_SET" == true && -z "$REMOTE_USER" ]]; then
+    print_error "The --user value is empty. Provide a username, or omit --user to default to '$CURRENT_USER'."
+    exit 1
+fi
+REMOTE_USER="${REMOTE_USER:-$CURRENT_USER}"
 
 # Rotation mode: replace the key of an existing entry in place (reusing its
 # HostName/User/Port/IdentityFile from ~/.ssh/config), then exit.
@@ -407,7 +426,7 @@ if [[ -z "$COMMENT" ]]; then
     else
         LOCAL_HOST="localhost"
     fi
-    COMMENT="${LOCAL_USER}@${LOCAL_HOST}_to_${HOST}"
+    COMMENT="${CURRENT_USER}@${LOCAL_HOST}_to_${HOST}"
 fi
 
 if [[ -z "$ALIAS" ]]; then
@@ -436,8 +455,7 @@ fi
 # Display configuration
 print_info "SSH Key Generation Configuration:"
 echo "  Host: $HOST"
-echo "  User: $USER"
-echo "  Local User: $LOCAL_USER"
+echo "  User: $REMOTE_USER"
 echo "  Port: $PORT"
 echo "  Key Type: $KEY_TYPE"
 echo "  Key Name: $KEY_NAME"
@@ -458,11 +476,9 @@ if [[ -f "$KEY_FILE" ]]; then
     rm -f "$KEY_FILE" "$KEY_FILE.pub"
 fi
 
-# Create .ssh directory if it doesn't exist (owned by the target user)
-if [[ ! -d "$SSH_DIR" ]]; then
-    mkdir -p "$SSH_DIR"
-    fix_owner "$SSH_DIR"
-fi
+# Create .ssh directory if it doesn't exist. mkdir/chmod are idempotent, so no
+# guard is needed; running as the target user keeps ownership correct.
+mkdir -p "$SSH_DIR"
 chmod 700 "$SSH_DIR"
 
 # Generate SSH key
@@ -482,18 +498,17 @@ fi
 
 print_success "SSH key generated successfully!"
 
-# Set proper permissions and ownership
+# Set proper permissions
 chmod 600 "$KEY_FILE"
 chmod 644 "$KEY_FILE.pub"
-fix_owner "$KEY_FILE" "$KEY_FILE.pub"
 
 # Copy key to server
-print_info "Copying public key to $USER@$HOST:$PORT..."
+print_info "Copying public key to $REMOTE_USER@$HOST:$PORT..."
 
 # Manual fallback: append the public key to the server's authorized_keys.
 # Reads the key via stdin redirection (no useless cat) and returns ssh's exit status.
 copy_key_manual() {
-    ssh -p "$PORT" "${SSH_USER_OPTS[@]}" "$USER@$HOST" \
+    ssh -p "$PORT" "$REMOTE_USER@$HOST" \
         "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" \
         < "$KEY_FILE.pub"
 }
@@ -501,7 +516,7 @@ copy_key_manual() {
 # Try ssh-copy-id first, fall back to the manual method if it is missing or fails.
 # Each command is the condition of an if, so set -e does not abort before we react.
 if command -v ssh-copy-id >/dev/null 2>&1; then
-    if ssh-copy-id -i "$KEY_FILE.pub" -p "$PORT" "${SSH_USER_OPTS[@]}" "$USER@$HOST"; then
+    if ssh-copy-id -i "$KEY_FILE.pub" -p "$PORT" "$REMOTE_USER@$HOST"; then
         print_success "Public key copied successfully using ssh-copy-id"
     else
         print_warning "ssh-copy-id failed, trying manual method..."
@@ -533,7 +548,7 @@ CONFIG_ENTRY="
 # $COMMENT
 Host $ALIAS
     HostName $HOST
-    User $USER
+    User $REMOTE_USER
     Port $PORT
     IdentityFile $KEY_FILE
     IdentitiesOnly yes
@@ -581,17 +596,12 @@ else
     print_success "SSH config created"
 fi
 
-# Set proper permissions and ownership on config file
+# Set proper permissions on config file
 chmod 600 "$SSH_CONFIG"
-fix_owner "$SSH_CONFIG"
-if [[ -f "$SSH_DIR/known_hosts" ]]; then
-    fix_owner "$SSH_DIR/known_hosts"
-fi
 
-# Test the connection using the target user's config (root's own ~/.ssh/config
-# would not know the alias when installing for someone else)
+# Test the connection
 print_info "Testing SSH connection..."
-if ssh -F "$SSH_CONFIG" "${SSH_USER_OPTS[@]}" -o ConnectTimeout=10 -o BatchMode=yes "$ALIAS" "echo 'SSH connection successful'" 2>/dev/null; then
+if ssh -o ConnectTimeout=10 -o BatchMode=yes "$ALIAS" "echo 'SSH connection successful'" 2>/dev/null; then
     print_success "SSH connection test passed!"
 else
     print_warning "SSH connection test failed. This might be normal if the server doesn't allow non-interactive connections."
@@ -607,9 +617,6 @@ echo "  ✓ SSH config updated"
 echo
 print_info "You can now connect using:"
 echo "  ssh $ALIAS"
-if [[ "$LOCAL_USER" != "$CURRENT_USER" ]]; then
-    print_info "Key and config were installed for '$LOCAL_USER' ($SSH_DIR); connect as that user."
-fi
 echo
 print_info "Or test the connection:"
 echo "  ssh -v $ALIAS"
