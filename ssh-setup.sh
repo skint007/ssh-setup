@@ -36,6 +36,19 @@ print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# Single source of truth for the date tag embedded in key comments (valid for
+# grep -E, sed -E, and awk dynamic regexes) and for interpreting "Host" lines
+# and config values in awk — every reader/writer below shares these so the
+# formats can't drift apart.
+DATE_TAG_RE='\((created|rotated) [0-9]{4}-[0-9]{2}-[0-9]{2}\)'
+AWK_HOST_FUNCS='
+    function host_line_matches(host,   i) {
+        for (i = 2; i <= NF; i++) if ($i == host) return 1
+        return 0
+    }
+    function unquote(s) { gsub(/^"|"$/, "", s); return s }
+'
+
 # Function to show usage
 usage() {
     cat << EOF
@@ -88,57 +101,60 @@ EOF
 # patterns. Exact token comparison keeps regex/glob aliases (e.g. *.example.com)
 # safe and matches multi-alias "Host a b c" lines correctly.
 host_exists() {
-    awk -v host="$1" '
-        /^[[:space:]]*[Hh]ost[[:space:]]/ {
-            for (i = 2; i <= NF; i++) if ($i == host) { found = 1; exit }
-        }
+    awk -v host="$1" "$AWK_HOST_FUNCS"'
+        /^[[:space:]]*[Hh]ost[[:space:]]/ { if (host_line_matches(host)) { found = 1; exit } }
         END { exit found ? 0 : 1 }
     ' "$2"
 }
 
 # Print the value of SSH config keyword $2 from the Host block whose alias is $1
-# (read from $SSH_CONFIG). Handles the space-separated form this tool writes.
+# (read from $SSH_CONFIG). Handles the space-separated form this tool writes;
+# surrounding double quotes (legal ssh_config syntax) are stripped.
 config_get() {
-    awk -v host="$1" -v key="$2" '
-        /^[[:space:]]*[Hh]ost[[:space:]]/ {
-            inblk = 0
-            for (i = 2; i <= NF; i++) if ($i == host) inblk = 1
-            next
-        }
+    awk -v host="$1" -v key="$2" "$AWK_HOST_FUNCS"'
+        /^[[:space:]]*[Hh]ost[[:space:]]/ { inblk = host_line_matches(host); next }
         inblk && tolower($1) == tolower(key) {
-            $1 = ""; sub(/^[[:space:]]+/, ""); print; exit
+            $1 = ""; sub(/^[[:space:]]+/, ""); print unquote($0); exit
         }
     ' "$SSH_CONFIG"
 }
 
 # Print the epoch time key $1 was created or last rotated: prefers the
 # "(created YYYY-MM-DD)"/"(rotated YYYY-MM-DD)" tag this script embeds in the
-# key comment, falling back to the private key file's mtime (rotation rewrites
-# the file, so mtime tracks rotation even for untagged keys). Fails if neither
-# the .pub nor the private key exists.
+# key comment, falling back to the key file's mtime — private key first, then
+# the .pub (rotation rewrites both, so mtime tracks rotation even for untagged
+# keys). Fails only if neither file exists.
 key_stamp_epoch() {
-    local key="$1" d=""
+    local key="$1" d="" epoch=""
     if [[ -f "$key.pub" ]]; then
-        d=$(grep -oE '\((created|rotated) [0-9]{4}-[0-9]{2}-[0-9]{2}\)' "$key.pub" \
+        d=$(grep -oE "$DATE_TAG_RE" "$key.pub" \
             | tail -n1 | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}') || true
-        if [[ -n "$d" ]]; then
-            date -d "$d" +%s
-            return
+        # A tag that is not a real calendar date (e.g. 2026-13-45) falls
+        # through to the mtime fallback instead of erroring out.
+        if [[ -n "$d" ]] && epoch=$(date -d "$d" +%s 2>/dev/null); then
+            echo "$epoch"
+            return 0
         fi
     fi
-    [[ -f "$key" ]] && stat -c %Y "$key"
+    if [[ -f "$key" ]]; then
+        stat -c %Y "$key"
+    elif [[ -f "$key.pub" ]]; then
+        stat -c %Y "$key.pub"
+    else
+        return 1
+    fi
 }
 
 # Strip any "(created ...)"/"(rotated ...)" date tag from a key comment, so a
 # fresh tag can be appended without stacking one per rotation.
 strip_date_tag() {
-    sed -E 's/ *\((created|rotated) [0-9]{4}-[0-9]{2}-[0-9]{2}\)//g' <<< "$1"
+    sed -E "s/ *${DATE_TAG_RE}//g" <<< "$1"
 }
 
 # Show the age of every key referenced by a Host entry in ~/.ssh/config and
 # offer to rotate each one older than MAX_AGE_DAYS.
 do_check_age() {
-    local now alias file key epoch age status stamp
+    local now alias file key epoch age status color stamp entries
     local due=()
 
     if [[ ! -f "$SSH_CONFIG" ]]; then
@@ -146,35 +162,58 @@ do_check_age() {
         return 1
     fi
 
+    # "alias<TAB>identityfile" per Host block: the first non-glob alias
+    # represents the block (so "Host *.x.com myhost" is still listed), the
+    # first IdentityFile wins, and quoted paths are unquoted. Collected up
+    # front so an awk failure is a hard error, not a silently empty report.
+    if ! entries=$(awk "$AWK_HOST_FUNCS"'
+        /^[[:space:]]*[Hh]ost[[:space:]]/ {
+            alias = ""; idf = 0
+            for (i = 2; i <= NF; i++) if ($i !~ /[*?]/) { alias = $i; break }
+            next
+        }
+        alias != "" && !idf && tolower($1) == "identityfile" {
+            idf = 1
+            $1 = ""; sub(/^[[:space:]]+/, "")
+            print alias "\t" unquote($0)
+        }
+    ' "$SSH_CONFIG"); then
+        print_error "Could not parse $SSH_CONFIG."
+        return 1
+    fi
+    if [[ -z "$entries" ]]; then
+        print_info "No Host entries with an IdentityFile found in $SSH_CONFIG."
+        return 0
+    fi
+
     now=$(date +%s)
     print_info "Checking key ages (rotation due after $MAX_AGE_DAYS days):"
     echo
     printf '  %-20s %-12s %6s  %-14s %s\n' "HOST" "CREATED" "AGE" "STATUS" "KEY"
 
-    # Entries are emitted by the awk below as "alias<TAB>identityfile", one per
-    # Host block (first IdentityFile wins; glob aliases are skipped).
     while IFS=$'\t' read -r alias file; do
         key="${file/#\~/$HOME}"
         if epoch=$(key_stamp_epoch "$key"); then
             age=$(( (now - epoch) / 86400 ))
             stamp=$(date -d "@$epoch" +%Y-%m-%d)
-            if (( age >= MAX_AGE_DAYS )); then
-                status="${RED}rotation due${NC}"
+            if (( age < 0 )); then
+                # A tag in the future (typo, clock skew) would read as a huge
+                # negative age and count as "ok" forever — flag it instead.
+                age=0
+                color="$YELLOW"; status="future date?"
+            elif (( age >= MAX_AGE_DAYS )); then
+                color="$RED"; status="rotation due"
                 due+=("$alias")
             else
-                status="${GREEN}ok${NC}"
+                color="$GREEN"; status="ok"
             fi
-            printf '  %-20s %-12s %5sd  %-25b %s\n' "$alias" "$stamp" "$age" "$status" "$key"
+            printf "  %-20s %-12s %6s  ${color}%-14s${NC} %s\n" \
+                "$alias" "$stamp" "${age}d" "$status" "$key"
         else
-            printf '  %-20s %-12s %6s  %-25b %s\n' "$alias" "-" "-" "${YELLOW}key missing${NC}" "$key"
+            printf "  %-20s %-12s %6s  ${YELLOW}%-14s${NC} %s\n" \
+                "$alias" "-" "-" "key missing" "$key"
         fi
-    done < <(awk '
-        /^[[:space:]]*[Hh]ost[[:space:]]/ { alias = $2; idf = 0; next }
-        alias != "" && !idf && tolower($1) == "identityfile" {
-            idf = 1
-            if (alias !~ /[*?]/) print alias "\t" $2
-        }
-    ' "$SSH_CONFIG")
+    done <<< "$entries"
 
     echo
     if (( ${#due[@]} == 0 )); then
@@ -214,16 +253,14 @@ CONFIG_COMMENT_TAGGED=false
 update_config_comment() {
     local target="$1" tmp
     tmp=$(mktemp)
-    awk -v host="$target" -v date="$(date +%Y-%m-%d)" '
+    DATE_TAG_RE="$DATE_TAG_RE" awk -v host="$target" -v date="$(date +%Y-%m-%d)" "$AWK_HOST_FUNCS"'
         { lines[NR] = $0 }
         !done && /^[[:space:]]*[Hh]ost[[:space:]]/ {
-            for (i = 2; i <= NF; i++)
-                if ($i == host && NR > 1 && lines[NR-1] ~ /^[[:space:]]*#/) {
-                    gsub(/ *\((created|rotated) [0-9]{4}-[0-9]{2}-[0-9]{2}\)/, "", lines[NR-1])
-                    lines[NR-1] = lines[NR-1] " (rotated " date ")"
-                    done = 1
-                    break
-                }
+            if (host_line_matches(host) && NR > 1 && lines[NR-1] ~ /^[[:space:]]*#/) {
+                gsub(" *" ENVIRON["DATE_TAG_RE"], "", lines[NR-1])
+                lines[NR-1] = lines[NR-1] " (rotated " date ")"
+                done = 1
+            }
         }
         END { for (k = 1; k <= NR; k++) print lines[k] }
     ' "$SSH_CONFIG" > "$tmp" || { rm -f "$tmp"; return 0; }
@@ -244,6 +281,10 @@ update_config_comment() {
 do_rotate() {
     local target hostname user port old_key old_pub old_blob old_comment
     local key_type bits new_key new_comment installed old_deleted remote_rm
+
+    # Per-rotation flag, reset here so a --check-age batch can't carry a stale
+    # "tagged" state from an earlier rotation into this one's summary.
+    CONFIG_COMMENT_TAGGED=false
 
     target="${1:-${ALIAS:-$HOST}}"
     if [[ -z "$target" ]]; then
@@ -350,7 +391,9 @@ do_rotate() {
 
     # Verify the new key BEFORE removing the old one, so a failure can't lock us out
     print_info "Verifying the new key works..."
-    if ! ssh -i "$new_key" -p "$port" -o IdentitiesOnly=yes -o BatchMode=yes \
+    # -n: don't let ssh consume our stdin — a --check-age batch reads its
+    # "Rotate?" answers from the same terminal after this call returns.
+    if ! ssh -n -i "$new_key" -p "$port" -o IdentitiesOnly=yes -o BatchMode=yes \
             -o ConnectTimeout=10 "$user@$hostname" "true" >/dev/null 2>&1; then
         print_error "The new key did not authenticate. Aborting rotation; the old key is untouched."
         print_warning "An unused public key may have been added to the server; remove it manually if desired."
@@ -379,7 +422,7 @@ do_rotate() {
     if [[ -n "$old_blob" ]]; then
         print_info "Removing the old key from the server's authorized_keys..."
         remote_rm="f=\$HOME/.ssh/authorized_keys; if [ -f \"\$f\" ]; then grep -vF '$old_blob' \"\$f\" > \"\$f.tmp\" 2>/dev/null || true; if [ -s \"\$f.tmp\" ]; then mv \"\$f.tmp\" \"\$f\"; chmod 600 \"\$f\"; else rm -f \"\$f.tmp\"; fi; fi"
-        if ssh -i "$old_key" -p "$port" -o IdentitiesOnly=yes -o BatchMode=yes \
+        if ssh -n -i "$old_key" -p "$port" -o IdentitiesOnly=yes -o BatchMode=yes \
                 "$user@$hostname" "$remote_rm"; then
             print_success "Old key removed from the server."
         else
@@ -471,6 +514,10 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --max-age)
+            if [[ $# -lt 2 ]]; then
+                print_error "--max-age requires a value (number of days)."
+                exit 1
+            fi
             MAX_AGE_DAYS="$2"
             shift 2
             ;;
@@ -584,7 +631,7 @@ fi
 
 # Tag the comment with the creation date so --check-age can compute key age
 # later without any external state.
-if [[ "$COMMENT" != *"(created "* && "$COMMENT" != *"(rotated "* ]]; then
+if ! grep -qE "$DATE_TAG_RE" <<< "$COMMENT"; then
     COMMENT="$COMMENT (created $(date +%Y-%m-%d))"
 fi
 
@@ -724,12 +771,12 @@ if [[ -f "$SSH_CONFIG" ]]; then
             # Remove the existing block, including the comment/blank lines that head it,
             # then append the new entry. Buffered comment/blank lines are dropped when
             # they belong to the removed block and flushed (kept) otherwise.
-            awk -v host="$ALIAS" '
+            awk -v host="$ALIAS" "$AWK_HOST_FUNCS"'
                 function flush() { printf "%s", buf; buf = "" }
                 /^[[:space:]]*#/ { if (skip) next; buf = buf $0 "\n"; next }
                 /^[[:space:]]*$/ { if (skip) { skip = 0; buf = ""; next } buf = buf $0 "\n"; next }
                 /^[[:space:]]*[Hh]ost[[:space:]]/ {
-                    for (i = 2; i <= NF; i++) if ($i == host) { skip = 1; buf = ""; next }
+                    if (host_line_matches(host)) { skip = 1; buf = ""; next }
                     flush(); print; next
                 }
                 { if (skip) next; flush(); print }
