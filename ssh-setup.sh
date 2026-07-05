@@ -76,7 +76,9 @@ OPTIONS:
     --rotate            Rotate the key of an existing entry (selected by --alias
                         or --host): generate a fresh key matching the old one,
                         install it, verify it, then remove the old key from the
-                        server. Reuses the entry's HostName/User/Port.
+                        server. Reuses the entry's HostName/User/Port. GitHub
+                        hosts are rotated via the gh CLI (needs gh with the
+                        admin:public_key scope) instead of authorized_keys.
     --check-age         List every key referenced by ~/.ssh/config with its age
                         (from the date tag in the key comment, or file mtime)
                         and offer to rotate any due for rotation
@@ -223,10 +225,19 @@ do_check_age() {
 
     print_warning "${#due[@]} key(s) due for rotation."
     for alias in "${due[@]}"; do
-        read -p "Rotate '$alias' now? (y/N): " -n 1 -r
+        # A bare `read` failing (e.g. EOF on a piped/exhausted stdin) would trip
+        # set -e and kill the batch mid-way; treat any read failure as "stop".
+        if ! read -p "Rotate '$alias' now? (y/N): " -n 1 -r; then
+            echo
+            print_info "No more input; stopping."
+            break
+        fi
         echo
         if [[ $REPLY =~ ^[Yy]$ ]]; then
-            do_rotate "$alias" || print_error "Rotation of '$alias' failed; continuing with the rest."
+            # Feed do_rotate its stdin from /dev/null so nothing inside it
+            # (notably ssh-copy-id, which reads the terminal) can swallow the
+            # remaining "Rotate?" answers and strand the rest of the batch.
+            do_rotate "$alias" </dev/null || print_error "Rotation of '$alias' failed; continuing with the rest."
             echo
         fi
     done
@@ -275,12 +286,43 @@ update_config_comment() {
     fi
 }
 
+# Return success if hostname $1 is GitHub (github.com, or a *.github.com host
+# such as ssh.github.com). GitHub gives no shell, so its keys can't be rotated
+# over the authorized_keys path — do_rotate routes these through the gh CLI.
+is_github_host() {
+    local h="${1,,}"
+    [[ "$h" == "github.com" || "$h" == *.github.com ]]
+}
+
+# Preflight the GitHub CLI before a GitHub rotation: gh must be installed,
+# authenticated, and hold the admin:public_key scope (needed to add/remove keys).
+# Probing the API is the reliable scope test — `gh ssh-key list` only prints a
+# warning but can still exit 0 without the scope, whereas `gh api` fails hard.
+gh_preflight() {
+    if ! command -v gh >/dev/null 2>&1; then
+        print_error "This entry is a GitHub host; rotating its key needs the GitHub CLI (gh)."
+        print_warning "Install it (e.g. 'pacman -S github-cli') and run 'gh auth login', then retry."
+        return 1
+    fi
+    if ! gh auth status >/dev/null 2>&1; then
+        print_error "The GitHub CLI is not authenticated. Run 'gh auth login' and retry."
+        return 1
+    fi
+    if ! gh api user/keys >/dev/null 2>&1; then
+        print_error "The GitHub CLI lacks the 'admin:public_key' scope needed to manage SSH keys."
+        print_warning "Grant it with: gh auth refresh -h github.com -s admin:public_key"
+        return 1
+    fi
+    return 0
+}
+
 # Rotate the key for an existing config entry, replacing it in place. Returns
 # non-zero (without touching the old key) if anything before the swap fails, so
 # a failed rotation can never lock you out.
 do_rotate() {
-    local target hostname user port old_key old_pub old_blob old_comment
+    local target hostname user port old_key old_pub old_blob old_type old_comment
     local key_type bits new_key new_comment installed old_deleted remote_rm
+    local provider="ssh" verified vout old_id
 
     # Per-rotation flag, reset here so a --check-age batch can't carry a stale
     # "tagged" state from an earlier rotation into this one's summary.
@@ -309,6 +351,15 @@ do_rotate() {
         return 1
     fi
 
+    # GitHub gives no shell, so the authorized_keys rotation path can't work.
+    # Detect it and drive rotation through the GitHub API via the gh CLI instead.
+    # The SSH username to GitHub is always "git", regardless of the config's User.
+    if is_github_host "$hostname"; then
+        provider="github"
+        user="git"
+        gh_preflight || return 1
+    fi
+
     print_info "Rotating SSH key for '$target' ($user@$hostname:$port)"
     echo "  Current key: $old_key"
     echo
@@ -322,9 +373,11 @@ do_rotate() {
     fi
 
     if [[ -f "$old_pub" ]]; then
+        old_type=$(awk '{print $1}' "$old_pub")
         old_blob=$(awk '{print $2}' "$old_pub")
         old_comment=$(cut -d' ' -f3- "$old_pub")
     else
+        old_type=""
         old_blob=""
         old_comment=""
         print_warning "Old public key unavailable; it cannot be auto-removed from the server."
@@ -366,24 +419,33 @@ do_rotate() {
     fi
     chmod 600 "$new_key"; chmod 644 "$new_key.pub"
 
-    # Install the new public key, preferring the old key for non-interactive auth
-    print_info "Installing new public key on $user@$hostname:$port..."
     installed=false
-    if [[ -f "$old_key" ]] && ssh -i "$old_key" -p "$port" \
-            -o IdentitiesOnly=yes -o BatchMode=yes "$user@$hostname" \
-            "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" \
-            < "$new_key.pub"; then
-        installed=true
-    elif command -v ssh-copy-id >/dev/null 2>&1 && \
-            ssh-copy-id -i "$new_key.pub" -p "$port" "$user@$hostname"; then
-        installed=true
-    elif ssh -p "$port" "$user@$hostname" \
-            "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" \
-            < "$new_key.pub"; then
-        installed=true
+    if [[ "$provider" == github ]]; then
+        # Register the new public key on the account; gh uses its own token, so
+        # this works even when the old private key is already gone.
+        print_info "Adding the new public key to your GitHub account..."
+        if gh ssh-key add "$new_key.pub" --title "$new_comment"; then
+            installed=true
+        fi
+    else
+        # Install the new public key, preferring the old key for non-interactive auth
+        print_info "Installing new public key on $user@$hostname:$port..."
+        if [[ -f "$old_key" ]] && ssh -i "$old_key" -p "$port" \
+                -o IdentitiesOnly=yes -o BatchMode=yes "$user@$hostname" \
+                "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" \
+                < "$new_key.pub"; then
+            installed=true
+        elif command -v ssh-copy-id >/dev/null 2>&1 && \
+                ssh-copy-id -i "$new_key.pub" -p "$port" "$user@$hostname"; then
+            installed=true
+        elif ssh -p "$port" "$user@$hostname" \
+                "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" \
+                < "$new_key.pub"; then
+            installed=true
+        fi
     fi
     if [[ "$installed" != true ]]; then
-        print_error "Could not install the new key on the server. Aborting; nothing changed."
+        print_error "Could not install the new key. Aborting; nothing changed."
         rm -f "$new_key" "$new_key.pub"
         return 1
     fi
@@ -393,10 +455,24 @@ do_rotate() {
     print_info "Verifying the new key works..."
     # -n: don't let ssh consume our stdin — a --check-age batch reads its
     # "Rotate?" answers from the same terminal after this call returns.
-    if ! ssh -n -i "$new_key" -p "$port" -o IdentitiesOnly=yes -o BatchMode=yes \
+    verified=false
+    if [[ "$provider" == github ]]; then
+        # GitHub closes the session with exit status 1 even on success, so key
+        # off its "successfully authenticated" banner instead of the exit code.
+        # Capture first, then grep: piping straight into grep would let pipefail
+        # surface ssh's exit 1 and read as a failure.
+        vout=$(ssh -n -i "$new_key" -p "$port" -o IdentitiesOnly=yes -o BatchMode=yes \
+                -o ConnectTimeout=10 -T "$user@$hostname" 2>&1) || true
+        if grep -qi "successfully authenticated" <<< "$vout"; then
+            verified=true
+        fi
+    elif ssh -n -i "$new_key" -p "$port" -o IdentitiesOnly=yes -o BatchMode=yes \
             -o ConnectTimeout=10 "$user@$hostname" "true" >/dev/null 2>&1; then
+        verified=true
+    fi
+    if [[ "$verified" != true ]]; then
         print_error "The new key did not authenticate. Aborting rotation; the old key is untouched."
-        print_warning "An unused public key may have been added to the server; remove it manually if desired."
+        print_warning "An unused public key may have been added to the ${provider/ssh/server}; remove it manually if desired."
         rm -f "$new_key" "$new_key.pub"
         return 1
     fi
@@ -417,9 +493,23 @@ do_rotate() {
     # Keep the config's comment header in sync with the key's rotation date
     update_config_comment "$target"
 
-    # Remove the old public key from the server, authenticating with the new key.
-    # Only overwrites authorized_keys when the filtered result is non-empty.
-    if [[ -n "$old_blob" ]]; then
+    # Remove the old public key. For GitHub, look up its numeric id by matching
+    # the stored "<type> <blob>" (GitHub keeps no comment) and delete it via the
+    # API. For a regular server, filter it out of authorized_keys using the new
+    # key to authenticate; only overwrite when the filtered result is non-empty.
+    if [[ "$provider" == github ]]; then
+        if [[ -n "$old_blob" ]]; then
+            print_info "Removing the old key from your GitHub account..."
+            old_id=$(gh api --paginate user/keys --jq '.[] | [.id, .key] | @tsv' 2>/dev/null \
+                | awk -F'\t' -v k="$old_type $old_blob" '$2 == k { print $1; exit }') || true
+            if [[ -n "$old_id" ]] && gh ssh-key delete "$old_id" --yes >/dev/null 2>&1; then
+                print_success "Old key removed from GitHub (id $old_id)."
+            else
+                print_warning "Could not remove the old key from GitHub automatically."
+                print_warning "Delete it manually at https://github.com/settings/keys"
+            fi
+        fi
+    elif [[ -n "$old_blob" ]]; then
         print_info "Removing the old key from the server's authorized_keys..."
         remote_rm="f=\$HOME/.ssh/authorized_keys; if [ -f \"\$f\" ]; then grep -vF '$old_blob' \"\$f\" > \"\$f.tmp\" 2>/dev/null || true; if [ -s \"\$f.tmp\" ]; then mv \"\$f.tmp\" \"\$f\"; chmod 600 \"\$f\"; else rm -f \"\$f.tmp\"; fi; fi"
         if ssh -n -i "$old_key" -p "$port" -o IdentitiesOnly=yes -o BatchMode=yes \
@@ -439,7 +529,13 @@ do_rotate() {
     echo "  ✓ New key verified working"
     [[ "$old_deleted" == true ]] && echo "  ✓ Old key deleted locally"
     [[ "$CONFIG_COMMENT_TAGGED" == true ]] && echo "  ✓ Config comment tagged (rotated $(date +%Y-%m-%d))"
-    [[ -n "$old_blob" ]] && echo "  ✓ Old key removed from server (or manual instructions printed above)"
+    if [[ -n "$old_blob" ]]; then
+        if [[ "$provider" == github ]]; then
+            echo "  ✓ Old key removed from GitHub (or manual instructions printed above)"
+        else
+            echo "  ✓ Old key removed from server (or manual instructions printed above)"
+        fi
+    fi
     echo
     print_info "Connect as usual:"
     echo "  ssh $target"

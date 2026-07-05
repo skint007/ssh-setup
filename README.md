@@ -152,6 +152,34 @@ unchanged. Once rotation completes, the old key no longer grants access anywhere
 > passphrase and isn't loaded in an agent, the old-key auth step falls back to
 > `ssh-copy-id`/password.
 
+### Rotating a GitHub key
+
+GitHub gives you no shell, so the `authorized_keys` steps above don't apply to it.
+When a `Host` entry resolves to `github.com` (or a `*.github.com` host such as
+`ssh.github.com`), rotation is automatically driven through the **GitHub API via
+the [`gh`](https://cli.github.com/) CLI** instead:
+
+1. Generate the new key (same type/size), exactly as above.
+2. **Add** the new public key to your account with `gh ssh-key add`.
+3. **Verify** it works with `ssh -T git@github.com` — matched on GitHub's
+   *"successfully authenticated"* banner, since GitHub always closes the session
+   with a non-zero exit status.
+4. Swap the new key into the original filename (same as a normal rotation).
+5. **Delete** the old key from your account with `gh ssh-key delete`, located by
+   matching its public-key material via `gh api user/keys`.
+
+This requires `gh` to be installed, authenticated (`gh auth login`), and to hold
+the `admin:public_key` scope. If the scope is missing, rotation stops **before
+generating anything** and tells you to grant it:
+
+```bash
+gh auth refresh -h github.com -s admin:public_key
+```
+
+> **Note:** only GitHub is handled this way. Other git hosts (GitLab, Bitbucket,
+> Codeberg, self-hosted GitHub Enterprise) still use the `authorized_keys` path
+> and would need their own web UI/API for key rotation.
+
 ## Checking key ages
 
 Every key the script creates or rotates carries a date tag in its comment —
@@ -179,10 +207,13 @@ the tag rather than stacking a new one each time.
 Rotate 'homeserver' now? (y/N):
 ```
 
-Answering `y` runs the normal [rotation flow](#rotating-a-key) for that entry.
-Keys made before this feature existed (no date tag in the comment) fall back to
-the private key file's modification time, which is accurate for any key this
-script generated or rotated. Glob entries (`Host *.example.com`) are skipped.
+Answering `y` runs the normal [rotation flow](#rotating-a-key) for that entry —
+including the [GitHub path](#rotating-a-github-key) when the entry points at
+`github.com`. A rotation that fails (e.g. the host is unreachable) is reported
+and the batch continues on to the remaining keys. Keys made before this feature
+existed (no date tag in the comment) fall back to the private key file's
+modification time, which is accurate for any key this script generated or
+rotated. Glob entries (`Host *.example.com`) are skipped.
 
 ## What it creates
 
