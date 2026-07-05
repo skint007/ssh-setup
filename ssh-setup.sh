@@ -41,9 +41,11 @@ usage() {
     cat << EOF
 Usage: $0 --host <hostname> [OPTIONS]          # set up a new key
        $0 --rotate --alias <name> [OPTIONS]    # rotate an existing key
+       $0 --check-age [--max-age <days>]       # find keys due for rotation
 
 Generate an SSH key, copy it to a server, and update ~/.ssh/config.
 With --rotate, replace the key of an existing config entry in place.
+With --check-age, list managed keys by age and offer to rotate old ones.
 
 OPTIONS:
     -h, --host          Target hostname or IP address (required for setup)
@@ -62,6 +64,11 @@ OPTIONS:
                         or --host): generate a fresh key matching the old one,
                         install it, verify it, then remove the old key from the
                         server. Reuses the entry's HostName/User/Port.
+    --check-age         List every key referenced by ~/.ssh/config with its age
+                        (from the date tag in the key comment, or file mtime)
+                        and offer to rotate any due for rotation
+    --max-age           Days before a key counts as due for rotation
+                        (default: 90; used with --check-age)
     --help              Show this help message
 
 Note: -h means --host, not help. Use --help for this message.
@@ -71,6 +78,7 @@ EXAMPLES:
     $0 -h 192.168.1.100 -u admin -p 2222 -n homeserver
     $0 --host github.com --user git --alias github --name github
     $0 --rotate --alias homeserver
+    $0 --check-age --max-age 180
     sudo $0 --host example.com --local-user skint007
 
 EOF
@@ -103,12 +111,131 @@ config_get() {
     ' "$SSH_CONFIG"
 }
 
+# Print the epoch time key $1 was created or last rotated: prefers the
+# "(created YYYY-MM-DD)"/"(rotated YYYY-MM-DD)" tag this script embeds in the
+# key comment, falling back to the private key file's mtime (rotation rewrites
+# the file, so mtime tracks rotation even for untagged keys). Fails if neither
+# the .pub nor the private key exists.
+key_stamp_epoch() {
+    local key="$1" d=""
+    if [[ -f "$key.pub" ]]; then
+        d=$(grep -oE '\((created|rotated) [0-9]{4}-[0-9]{2}-[0-9]{2}\)' "$key.pub" \
+            | tail -n1 | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}') || true
+        if [[ -n "$d" ]]; then
+            date -d "$d" +%s
+            return
+        fi
+    fi
+    [[ -f "$key" ]] && stat -c %Y "$key"
+}
+
+# Strip any "(created ...)"/"(rotated ...)" date tag from a key comment, so a
+# fresh tag can be appended without stacking one per rotation.
+strip_date_tag() {
+    sed -E 's/ *\((created|rotated) [0-9]{4}-[0-9]{2}-[0-9]{2}\)//g' <<< "$1"
+}
+
+# Show the age of every key referenced by a Host entry in ~/.ssh/config and
+# offer to rotate each one older than MAX_AGE_DAYS.
+do_check_age() {
+    local now alias file key epoch age status stamp
+    local due=()
+
+    if [[ ! -f "$SSH_CONFIG" ]]; then
+        print_error "No SSH config found at $SSH_CONFIG."
+        return 1
+    fi
+
+    now=$(date +%s)
+    print_info "Checking key ages (rotation due after $MAX_AGE_DAYS days):"
+    echo
+    printf '  %-20s %-12s %6s  %-14s %s\n' "HOST" "CREATED" "AGE" "STATUS" "KEY"
+
+    # Entries are emitted by the awk below as "alias<TAB>identityfile", one per
+    # Host block (first IdentityFile wins; glob aliases are skipped).
+    while IFS=$'\t' read -r alias file; do
+        key="${file/#\~/$HOME}"
+        if epoch=$(key_stamp_epoch "$key"); then
+            age=$(( (now - epoch) / 86400 ))
+            stamp=$(date -d "@$epoch" +%Y-%m-%d)
+            if (( age >= MAX_AGE_DAYS )); then
+                status="${RED}rotation due${NC}"
+                due+=("$alias")
+            else
+                status="${GREEN}ok${NC}"
+            fi
+            printf '  %-20s %-12s %5sd  %-25b %s\n' "$alias" "$stamp" "$age" "$status" "$key"
+        else
+            printf '  %-20s %-12s %6s  %-25b %s\n' "$alias" "-" "-" "${YELLOW}key missing${NC}" "$key"
+        fi
+    done < <(awk '
+        /^[[:space:]]*[Hh]ost[[:space:]]/ { alias = $2; idf = 0; next }
+        alias != "" && !idf && tolower($1) == "identityfile" {
+            idf = 1
+            if (alias !~ /[*?]/) print alias "\t" $2
+        }
+    ' "$SSH_CONFIG")
+
+    echo
+    if (( ${#due[@]} == 0 )); then
+        print_success "No keys are due for rotation."
+        return 0
+    fi
+
+    print_warning "${#due[@]} key(s) due for rotation."
+    for alias in "${due[@]}"; do
+        read -p "Rotate '$alias' now? (y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            do_rotate "$alias" || print_error "Rotation of '$alias' failed; continuing with the rest."
+            echo
+        fi
+    done
+    return 0
+}
+
 # Timestamped backup of the SSH config, taken only immediately before a write.
+# At most one backup per run, so it always captures the pre-run state (a
+# --check-age run rotating several keys doesn't leave a trail of backups).
+CONFIG_BACKED_UP=false
 backup_config() {
     local backup
+    [[ "$CONFIG_BACKED_UP" == true ]] && return 0
+    CONFIG_BACKED_UP=true
     backup="$SSH_CONFIG.backup.$(date +%Y%m%d_%H%M%S)"
     cp "$SSH_CONFIG" "$backup"
     print_info "Backup of SSH config created: $backup"
+}
+
+# Refresh the date tag in the comment line heading the Host block for alias $1,
+# so the config itself shows when the key was last rotated. Comment-only edit:
+# entries without a heading comment are left untouched.
+CONFIG_COMMENT_TAGGED=false
+update_config_comment() {
+    local target="$1" tmp
+    tmp=$(mktemp)
+    awk -v host="$target" -v date="$(date +%Y-%m-%d)" '
+        { lines[NR] = $0 }
+        !done && /^[[:space:]]*[Hh]ost[[:space:]]/ {
+            for (i = 2; i <= NF; i++)
+                if ($i == host && NR > 1 && lines[NR-1] ~ /^[[:space:]]*#/) {
+                    gsub(/ *\((created|rotated) [0-9]{4}-[0-9]{2}-[0-9]{2}\)/, "", lines[NR-1])
+                    lines[NR-1] = lines[NR-1] " (rotated " date ")"
+                    done = 1
+                    break
+                }
+        }
+        END { for (k = 1; k <= NR; k++) print lines[k] }
+    ' "$SSH_CONFIG" > "$tmp" || { rm -f "$tmp"; return 0; }
+    if ! cmp -s "$tmp" "$SSH_CONFIG"; then
+        backup_config
+        mv "$tmp" "$SSH_CONFIG"
+        chmod 600 "$SSH_CONFIG"
+        CONFIG_COMMENT_TAGGED=true
+        print_info "Config comment updated with the rotation date."
+    else
+        rm -f "$tmp"
+    fi
 }
 
 # Rotate the key for an existing config entry, replacing it in place. Returns
@@ -118,7 +245,7 @@ do_rotate() {
     local target hostname user port old_key old_pub old_blob old_comment
     local key_type bits new_key new_comment installed old_deleted remote_rm
 
-    target="${ALIAS:-$HOST}"
+    target="${1:-${ALIAS:-$HOST}}"
     if [[ -z "$target" ]]; then
         print_error "Rotate needs an entry to act on. Use --alias <name> (or --host)."
         usage
@@ -180,6 +307,8 @@ do_rotate() {
         esac
     fi
 
+    # Replace any existing date tag so repeat rotations don't stack them
+    old_comment=$(strip_date_tag "$old_comment")
     new_comment="${old_comment:-$target} (rotated $(date +%Y-%m-%d))"
     new_key="$old_key.rotated.$$"
     rm -f "$new_key" "$new_key.pub"
@@ -242,6 +371,9 @@ do_rotate() {
     mv "$new_key.pub" "$old_pub"
     chmod 600 "$old_key"; chmod 644 "$old_pub"
 
+    # Keep the config's comment header in sync with the key's rotation date
+    update_config_comment "$target"
+
     # Remove the old public key from the server, authenticating with the new key.
     # Only overwrites authorized_keys when the filtered result is non-empty.
     if [[ -n "$old_blob" ]]; then
@@ -263,6 +395,7 @@ do_rotate() {
     echo "  ✓ New $key_type key generated and installed: $old_key"
     echo "  ✓ New key verified working"
     [[ "$old_deleted" == true ]] && echo "  ✓ Old key deleted locally"
+    [[ "$CONFIG_COMMENT_TAGGED" == true ]] && echo "  ✓ Config comment tagged (rotated $(date +%Y-%m-%d))"
     [[ -n "$old_blob" ]] && echo "  ✓ Old key removed from server (or manual instructions printed above)"
     echo
     print_info "Connect as usual:"
@@ -281,6 +414,8 @@ KEY_NAME=""
 COMMENT=""
 ALIAS=""
 ROTATE=false
+CHECK_AGE=false
+MAX_AGE_DAYS=90
 LOCAL_USER=""
 
 # Keep the original arguments so we can re-exec as the target user unchanged
@@ -330,6 +465,14 @@ while [[ $# -gt 0 ]]; do
         --rotate)
             ROTATE=true
             shift
+            ;;
+        --check-age)
+            CHECK_AGE=true
+            shift
+            ;;
+        --max-age)
+            MAX_AGE_DAYS="$2"
+            shift 2
             ;;
         --help)
             usage
@@ -396,6 +539,16 @@ if [[ "$REMOTE_USER_SET" == true && -z "$REMOTE_USER" ]]; then
 fi
 REMOTE_USER="${REMOTE_USER:-$CURRENT_USER}"
 
+# Age-check mode: report key ages and offer rotations, then exit.
+if [[ "$CHECK_AGE" == true ]]; then
+    if ! [[ "$MAX_AGE_DAYS" =~ ^[0-9]+$ ]] || (( MAX_AGE_DAYS == 0 )); then
+        print_error "--max-age must be a positive number of days (got '$MAX_AGE_DAYS')."
+        exit 1
+    fi
+    do_check_age
+    exit $?
+fi
+
 # Rotation mode: replace the key of an existing entry in place (reusing its
 # HostName/User/Port/IdentityFile from ~/.ssh/config), then exit.
 if [[ "$ROTATE" == true ]]; then
@@ -427,6 +580,12 @@ if [[ -z "$COMMENT" ]]; then
         LOCAL_HOST="localhost"
     fi
     COMMENT="${CURRENT_USER}@${LOCAL_HOST}_to_${HOST}"
+fi
+
+# Tag the comment with the creation date so --check-age can compute key age
+# later without any external state.
+if [[ "$COMMENT" != *"(created "* && "$COMMENT" != *"(rotated "* ]]; then
+    COMMENT="$COMMENT (created $(date +%Y-%m-%d))"
 fi
 
 if [[ -z "$ALIAS" ]]; then

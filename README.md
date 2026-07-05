@@ -13,6 +13,11 @@ It can also **rotate** an existing key — generate a fresh one, install it, ver
 it works, and remove the old key from the server — with a single command. See
 [Rotating a key](#rotating-a-key).
 
+Every key it creates or rotates is stamped with a date tag in the key comment
+(`(created 2026-07-05)` / `(rotated 2026-07-05)`), and `--check-age` reads those
+tags back to tell you which keys are due for rotation — and offers to rotate
+them on the spot. See [Checking key ages](#checking-key-ages).
+
 ## Requirements
 
 - Bash 4+
@@ -49,6 +54,8 @@ Only `--host` is required; everything else has a sensible default.
 | `-b`, `--bits` | Key size **for RSA keys only** | `4096` |
 | `--alias` | `Host` alias written to `~/.ssh/config` | the host |
 | `--rotate` | Rotate the key of an existing entry instead of creating one (see [Rotating a key](#rotating-a-key)) | — |
+| `--check-age` | List managed keys by age and offer to rotate old ones (see [Checking key ages](#checking-key-ages)) | — |
+| `--max-age` | Days before a key counts as due for rotation (with `--check-age`) | `90` |
 | `--help` | Show usage and exit | — |
 
 > **Note:** `-h` means `--host`, not help. Use `--help` for the usage message.
@@ -70,6 +77,9 @@ Only `--host` is required; everything else has a sensible default.
 
 # Rotate the key for an existing entry
 ./ssh-setup.sh --rotate --alias homeserver
+
+# List all managed keys by age; offer to rotate any older than 180 days
+./ssh-setup.sh --check-age --max-age 180
 
 # As root, set up SSH access for skint007 instead of root
 sudo ./ssh-setup.sh --host example.com --local-user skint007
@@ -126,7 +136,9 @@ failure can never lock you out:
    the rotation aborts, the old key is left fully intact, and the temporary new
    key is removed.
 4. Delete the old local key and move the new key into the original filename — so
-   `~/.ssh/config` needs no edit.
+   the entry's `IdentityFile` needs no edit. The comment line heading the `Host`
+   block is refreshed to `(rotated <date>)`, so the config itself shows when the
+   key was last rotated.
 5. Remove the old public key from the server's `authorized_keys`.
 
 The old key is only deleted **after** the new key is confirmed working, so a
@@ -140,6 +152,38 @@ unchanged. Once rotation completes, the old key no longer grants access anywhere
 > passphrase and isn't loaded in an agent, the old-key auth step falls back to
 > `ssh-copy-id`/password.
 
+## Checking key ages
+
+Every key the script creates or rotates carries a date tag in its comment —
+`(created 2026-07-05)` or `(rotated 2026-07-05)` — stored in the `.pub` file,
+so the age travels with the key itself (no separate state file to lose, and
+the tag is even visible in the server's `authorized_keys`). Rotation replaces
+the tag rather than stacking a new one each time.
+
+`--check-age` walks every `Host` entry in `~/.ssh/config` that has an
+`IdentityFile`, reports each key's age, and offers to rotate the old ones:
+
+```bash
+./ssh-setup.sh --check-age                 # due after 90 days (default)
+./ssh-setup.sh --check-age --max-age 180   # custom threshold
+```
+
+```text
+[INFO] Checking key ages (rotation due after 90 days):
+
+  HOST                 CREATED         AGE  STATUS         KEY
+  homeserver           2025-12-17     200d  rotation due   /home/me/.ssh/id_ed25519_homeserver
+  github               2026-06-20      15d  ok             /home/me/.ssh/id_ed25519_github
+
+[WARNING] 1 key(s) due for rotation.
+Rotate 'homeserver' now? (y/N):
+```
+
+Answering `y` runs the normal [rotation flow](#rotating-a-key) for that entry.
+Keys made before this feature existed (no date tag in the comment) fall back to
+the private key file's modification time, which is accurate for any key this
+script generated or rotated. Glob entries (`Host *.example.com`) are skipped.
+
 ## What it creates
 
 For a host named `example.com` with the default `ed25519` type:
@@ -149,7 +193,7 @@ For a host named `example.com` with the default `ed25519` type:
 - **Config entry** appended to `~/.ssh/config`:
 
   ```ssh-config
-  # myuser@laptop_to_example.com
+  # myuser@laptop_to_example.com (created 2026-07-05)
   Host example.com
       HostName example.com
       User myuser
@@ -171,7 +215,9 @@ key and you can revoke access to one host without affecting the others.
   one afterwards with `ssh-keygen -p -f <keyfile>`.
 - **Existing key files** prompt before being overwritten.
 - **`~/.ssh/config` is backed up** to `~/.ssh/config.backup.<timestamp>` *only*
-  immediately before it is modified — declining a change leaves no clutter.
+  immediately before it is modified, at most once per run — declining a change
+  leaves no clutter, and a `--check-age` run that rotates several keys leaves a
+  single backup of the pre-run state.
 - **Re-running for an existing alias** prompts before replacing it. The old
   block is removed cleanly (including its leading comment) before the new one is
   appended, so the config doesn't accumulate stale or duplicate entries.
