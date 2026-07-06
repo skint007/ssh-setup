@@ -4,8 +4,10 @@ A single Bash script that automates the full "set up key-based SSH access to a h
 
 1. Generates a dedicated SSH key pair for the target host.
 2. Installs the public key on the server (`ssh-copy-id`, with a manual fallback).
-3. Adds a matching `Host` entry to `~/.ssh/config` (with a timestamped backup).
-4. Tests the connection so you know it worked.
+3. Offers to set up a recommended `Host *` defaults block if you don't have one
+   (see [Host \* defaults](#host--defaults)).
+4. Adds a matching `Host` entry to `~/.ssh/config` (with a timestamped backup).
+5. Tests the connection so you know it worked.
 
 After running it once per host, you connect with a short alias: `ssh myserver`.
 
@@ -221,7 +223,7 @@ For a host named `example.com` with the default `ed25519` type:
 
 - **Private key:** `~/.ssh/id_ed25519_example.com` (mode `600`)
 - **Public key:** `~/.ssh/id_ed25519_example.com.pub` (mode `644`)
-- **Config entry** appended to `~/.ssh/config`:
+- **Config entry** added to `~/.ssh/config` (above any `Host *` catch-all):
 
   ```ssh-config
   # myuser@laptop_to_example.com (created 2026-07-05)
@@ -239,6 +241,42 @@ key and you can revoke access to one host without affecting the others.
 `IdentitiesOnly yes` ensures only this key is offered for the host, avoiding
 "too many authentication failures" errors when you have many keys loaded.
 
+## Host \* defaults
+
+During setup, the script checks for a universal `Host *` catch-all block and
+offers to create it (or fill in anything missing) — always behind a `y/N`
+prompt. This matters most if you run scripts that open **many SSH connections in
+quick succession**: without connection multiplexing, the server can rate-limit or
+temporarily lock you out (`MaxStartups`). The recommended block is:
+
+```ssh-config
+Host *
+    ConnectTimeout 15
+    ServerAliveInterval 10
+    ServerAliveCountMax 2
+    StrictHostKeyChecking no
+    ControlMaster auto
+    ControlPath /tmp/ssh-%r@%h:%p
+    ControlPersist 300
+```
+
+- **`ControlMaster` / `ControlPath` / `ControlPersist`** multiplex repeated
+  connections over a single master socket (held open 5 min), so rapid-fire SSH
+  doesn't hammer the server with full handshakes.
+- **`ServerAlive*` / `ConnectTimeout`** keep long or idle sessions healthy and
+  fail fast on unreachable hosts.
+- **`StrictHostKeyChecking no`** auto-accepts host keys (convenient for
+  automation; a security trade-off — drop this line if you'd rather confirm
+  keys interactively).
+
+If your `Host *` block already has all of these, the check stays silent. The
+tool never edits the block without asking, and only ever *adds* missing lines —
+it won't change values you've set.
+
+> The script's own `ssh`/`ssh-copy-id` calls always pass `-o ControlPath=none`,
+> so provisioning ignores any existing master socket and connects directly to
+> the intended host — a stale master can't misdirect a key copy or verification.
+
 ## Behavior & safety
 
 - **Keys are generated without a passphrase** (`-N ""`) so connections are
@@ -251,9 +289,18 @@ key and you can revoke access to one host without affecting the others.
   single backup of the pre-run state.
 - **Re-running for an existing alias** prompts before replacing it. The old
   block is removed cleanly (including its leading comment) before the new one is
-  appended, so the config doesn't accumulate stale or duplicate entries.
+  re-inserted, so the config doesn't accumulate stale or duplicate entries.
 - **Alias matching is exact**, so glob-style aliases (e.g. `*.example.com`) and
   multi-alias `Host` lines are handled correctly.
+- **New entries are placed above a `Host *` catch-all** (rather than at the end
+  of the file). SSH config is first-match-wins, so a specific entry appended
+  below a catch-all that sets `User`/`IdentityFile`/`ProxyJump`/etc. could be
+  silently shadowed by it; keeping specifics above `Host *` avoids that.
+- **The script's own `ssh`/`ssh-copy-id` calls disable connection multiplexing**
+  (`-o ControlPath=none`). If your `Host *` block enables `ControlMaster` +
+  `ControlPersist`, a persisted master socket to the same name could otherwise
+  tunnel the key copy or verification to whatever host that old connection points
+  at — so provisioning always makes a fresh, direct connection to the real host.
 - **Rotation verifies the new key before removing the old one**, so an aborted
   rotation never leaves you locked out (see [Rotating a key](#rotating-a-key)).
 - **`umask 077`** is set so any files the script creates are not world-readable.

@@ -12,6 +12,13 @@ set -euo pipefail
 # Restrict permissions on any files/dirs this script creates (keys, config, temp)
 umask 077
 
+# Every ssh this script runs to provision, verify, or clean up a key must reach
+# the *intended* host directly. A "Host *" block with ControlMaster/ControlPersist
+# leaves a persisted master socket around, and a later ssh to the same name would
+# silently ride that master — tunnelling the key copy or the verify to whatever
+# host the old connection points at. ControlPath=none forces a fresh connection.
+SSH_NOMUX=(-o ControlPath=none)
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -156,7 +163,7 @@ strip_date_tag() {
 # Show the age of every key referenced by a Host entry in ~/.ssh/config and
 # offer to rotate each one older than MAX_AGE_DAYS.
 do_check_age() {
-    local now alias file key epoch age status color stamp entries
+    local now alias file key epoch age status color stamp entries hostw
     local due=()
 
     if [[ ! -f "$SSH_CONFIG" ]]; then
@@ -188,10 +195,15 @@ do_check_age() {
         return 0
     fi
 
+    # Size the HOST column to the widest alias (printf never truncates, so a
+    # fixed width would let long hostnames overflow and shove later columns out
+    # of alignment). Floor at the "HOST" header width so short lists stay tidy.
+    hostw=$(awk -F'\t' 'BEGIN { m = 4 } length($1) > m { m = length($1) } END { print m }' <<< "$entries")
+
     now=$(date +%s)
     print_info "Checking key ages (rotation due after $MAX_AGE_DAYS days):"
     echo
-    printf '  %-20s %-12s %6s  %-14s %s\n' "HOST" "CREATED" "AGE" "STATUS" "KEY"
+    printf '  %-*s %-12s %6s  %-14s %s\n' "$hostw" "HOST" "CREATED" "AGE" "STATUS" "KEY"
 
     while IFS=$'\t' read -r alias file; do
         key="${file/#\~/$HOME}"
@@ -209,11 +221,11 @@ do_check_age() {
             else
                 color="$GREEN"; status="ok"
             fi
-            printf "  %-20s %-12s %6s  ${color}%-14s${NC} %s\n" \
-                "$alias" "$stamp" "${age}d" "$status" "$key"
+            printf "  %-*s %-12s %6s  ${color}%-14s${NC} %s\n" \
+                "$hostw" "$alias" "$stamp" "${age}d" "$status" "$key"
         else
-            printf "  %-20s %-12s %6s  ${YELLOW}%-14s${NC} %s\n" \
-                "$alias" "-" "-" "key missing" "$key"
+            printf "  %-*s %-12s %6s  ${YELLOW}%-14s${NC} %s\n" \
+                "$hostw" "$alias" "-" "-" "key missing" "$key"
         fi
     done <<< "$entries"
 
@@ -283,6 +295,121 @@ update_config_comment() {
         print_info "Config comment updated with the rotation date."
     else
         rm -f "$tmp"
+    fi
+}
+
+# Copy config from file $1 to $2, inserting $CONFIG_ENTRY before the first
+# universal "Host *" catch-all block (backing up over the comment/blank lines
+# that head it). SSH config is first-match-wins, so a specific Host placed after
+# a catch-all can be shadowed by any User/IdentityFile/ProxyJump it sets — keep
+# specifics above "Host *". Falls back to appending when there is no catch-all.
+insert_config_entry() {
+    CONFIG_ENTRY="$CONFIG_ENTRY" awk '
+        function is_catchall(   i) { for (i = 2; i <= NF; i++) if ($i == "*") return 1; return 0 }
+        { lines[NR] = $0 }
+        !done && /^[[:space:]]*[Hh]ost[[:space:]]/ && is_catchall() {
+            insat = (runstart > 0 ? runstart : NR); done = 1
+        }
+        /^[[:space:]]*#/ || /^[[:space:]]*$/ { if (runstart == 0) runstart = NR; next }
+        { runstart = 0 }
+        END {
+            for (k = 1; k <= NR; k++) {
+                if (done && k == insat) print ENVIRON["CONFIG_ENTRY"]
+                print lines[k]
+            }
+            if (!done) print ENVIRON["CONFIG_ENTRY"]
+        }
+    ' "$1" > "$2"
+}
+
+# Recommended "Host *" defaults. Connection multiplexing (ControlMaster/Path/
+# Persist) reuses a single connection so scripts that fire many SSH sessions in
+# quick succession don't get rate-limited or locked out by the server's
+# MaxStartups; the ServerAlive/ConnectTimeout settings keep long or idle
+# sessions healthy. Order is the order they'll be written.
+RECOMMENDED_CATCHALL=(
+    "ConnectTimeout 15"
+    "ServerAliveInterval 10"
+    "ServerAliveCountMax 2"
+    "StrictHostKeyChecking no"
+    "ControlMaster auto"
+    "ControlPath /tmp/ssh-%r@%h:%p"
+    "ControlPersist 300"
+)
+
+# Return success if the first universal "Host *" block in $SSH_CONFIG already
+# sets keyword $1 (case-insensitive), so we only offer to add what's missing.
+catchall_has_keyword() {
+    awk -v key="$1" "$AWK_HOST_FUNCS"'
+        /^[[:space:]]*[Hh]ost[[:space:]]/ { inblk = host_line_matches("*"); next }
+        inblk && tolower($1) == tolower(key) { found = 1; exit }
+        END { exit found ? 0 : 1 }
+    ' "$SSH_CONFIG"
+}
+
+# During setup, make sure the user has a sensible "Host *" catch-all. If none
+# exists, offer to add the full recommended block; if one exists but is missing
+# some recommended settings, offer to add just those. Purely advisory — every
+# change is behind a prompt, and a complete block is left untouched (and silent).
+ensure_catchall_block() {
+    local line kw tmp
+    local missing=()
+
+    if [[ ! -f "$SSH_CONFIG" ]] || ! host_exists '*' "$SSH_CONFIG"; then
+        print_info "No 'Host *' defaults block found in your SSH config."
+        echo "  A catch-all with connection multiplexing + keepalives keeps rapid,"
+        echo "  repeated SSH connections from being rate-limited or locked out."
+        echo "  Proposed block:"
+        echo
+        echo "    Host *"
+        printf '        %s\n' "${RECOMMENDED_CATCHALL[@]}"
+        echo
+        read -p "Add this 'Host *' block to your SSH config? (y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            [[ -f "$SSH_CONFIG" ]] && backup_config
+            {
+                [[ -s "$SSH_CONFIG" ]] && printf '\n'
+                printf 'Host *\n'
+                printf '    %s\n' "${RECOMMENDED_CATCHALL[@]}"
+            } >> "$SSH_CONFIG"
+            chmod 600 "$SSH_CONFIG"
+            print_success "Added 'Host *' defaults block."
+        else
+            print_info "Left SSH config defaults unchanged."
+        fi
+        return 0
+    fi
+
+    # Block exists — collect any recommended settings it doesn't already have.
+    for line in "${RECOMMENDED_CATCHALL[@]}"; do
+        kw=${line%% *}
+        catchall_has_keyword "$kw" || missing+=("$line")
+    done
+    (( ${#missing[@]} == 0 )) && return 0   # already complete; stay quiet
+
+    print_warning "Your 'Host *' block is missing recommended setting(s):"
+    printf '        %s\n' "${missing[@]}"
+    read -p "Add the missing setting(s) to your 'Host *' block? (y/N): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        backup_config
+        tmp=$(mktemp)
+        # Insert the missing directives right after the first "Host *" line.
+        MISSING_LINES="$(printf '    %s\n' "${missing[@]}")" \
+        awk "$AWK_HOST_FUNCS"'
+            !added && /^[[:space:]]*[Hh]ost[[:space:]]/ && host_line_matches("*") {
+                # $(...) strips the trailing newline, so re-add it here to keep
+                # the last injected directive on its own line.
+                print; printf "%s\n", ENVIRON["MISSING_LINES"]; added = 1; next
+            }
+            { print }
+        ' "$SSH_CONFIG" > "$tmp"
+        mv "$tmp" "$SSH_CONFIG"
+        chmod 600 "$SSH_CONFIG"
+        print_success "Updated 'Host *' block with the missing setting(s)."
+    else
+        print_info "Left 'Host *' block unchanged."
     fi
 }
 
@@ -430,15 +557,15 @@ do_rotate() {
     else
         # Install the new public key, preferring the old key for non-interactive auth
         print_info "Installing new public key on $user@$hostname:$port..."
-        if [[ -f "$old_key" ]] && ssh -i "$old_key" -p "$port" \
+        if [[ -f "$old_key" ]] && ssh "${SSH_NOMUX[@]}" -i "$old_key" -p "$port" \
                 -o IdentitiesOnly=yes -o BatchMode=yes "$user@$hostname" \
                 "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" \
                 < "$new_key.pub"; then
             installed=true
         elif command -v ssh-copy-id >/dev/null 2>&1 && \
-                ssh-copy-id -i "$new_key.pub" -p "$port" "$user@$hostname"; then
+                ssh-copy-id "${SSH_NOMUX[@]}" -i "$new_key.pub" -p "$port" "$user@$hostname"; then
             installed=true
-        elif ssh -p "$port" "$user@$hostname" \
+        elif ssh "${SSH_NOMUX[@]}" -p "$port" "$user@$hostname" \
                 "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" \
                 < "$new_key.pub"; then
             installed=true
@@ -461,12 +588,12 @@ do_rotate() {
         # off its "successfully authenticated" banner instead of the exit code.
         # Capture first, then grep: piping straight into grep would let pipefail
         # surface ssh's exit 1 and read as a failure.
-        vout=$(ssh -n -i "$new_key" -p "$port" -o IdentitiesOnly=yes -o BatchMode=yes \
+        vout=$(ssh "${SSH_NOMUX[@]}" -n -i "$new_key" -p "$port" -o IdentitiesOnly=yes -o BatchMode=yes \
                 -o ConnectTimeout=10 -T "$user@$hostname" 2>&1) || true
         if grep -qi "successfully authenticated" <<< "$vout"; then
             verified=true
         fi
-    elif ssh -n -i "$new_key" -p "$port" -o IdentitiesOnly=yes -o BatchMode=yes \
+    elif ssh "${SSH_NOMUX[@]}" -n -i "$new_key" -p "$port" -o IdentitiesOnly=yes -o BatchMode=yes \
             -o ConnectTimeout=10 "$user@$hostname" "true" >/dev/null 2>&1; then
         verified=true
     fi
@@ -512,7 +639,7 @@ do_rotate() {
     elif [[ -n "$old_blob" ]]; then
         print_info "Removing the old key from the server's authorized_keys..."
         remote_rm="f=\$HOME/.ssh/authorized_keys; if [ -f \"\$f\" ]; then grep -vF '$old_blob' \"\$f\" > \"\$f.tmp\" 2>/dev/null || true; if [ -s \"\$f.tmp\" ]; then mv \"\$f.tmp\" \"\$f\"; chmod 600 \"\$f\"; else rm -f \"\$f.tmp\"; fi; fi"
-        if ssh -n -i "$old_key" -p "$port" -o IdentitiesOnly=yes -o BatchMode=yes \
+        if ssh "${SSH_NOMUX[@]}" -n -i "$old_key" -p "$port" -o IdentitiesOnly=yes -o BatchMode=yes \
                 "$user@$hostname" "$remote_rm"; then
             print_success "Old key removed from the server."
         else
@@ -810,7 +937,7 @@ print_info "Copying public key to $REMOTE_USER@$HOST:$PORT..."
 # Manual fallback: append the public key to the server's authorized_keys.
 # Reads the key via stdin redirection (no useless cat) and returns ssh's exit status.
 copy_key_manual() {
-    ssh -p "$PORT" "$REMOTE_USER@$HOST" \
+    ssh "${SSH_NOMUX[@]}" -p "$PORT" "$REMOTE_USER@$HOST" \
         "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" \
         < "$KEY_FILE.pub"
 }
@@ -818,7 +945,7 @@ copy_key_manual() {
 # Try ssh-copy-id first, fall back to the manual method if it is missing or fails.
 # Each command is the condition of an if, so set -e does not abort before we react.
 if command -v ssh-copy-id >/dev/null 2>&1; then
-    if ssh-copy-id -i "$KEY_FILE.pub" -p "$PORT" "$REMOTE_USER@$HOST"; then
+    if ssh-copy-id "${SSH_NOMUX[@]}" -i "$KEY_FILE.pub" -p "$PORT" "$REMOTE_USER@$HOST"; then
         print_success "Public key copied successfully using ssh-copy-id"
     else
         print_warning "ssh-copy-id failed, trying manual method..."
@@ -841,6 +968,10 @@ fi
 
 # Update ~/.ssh/config
 print_info "Updating SSH config..."
+
+# Offer to set up (or complete) a "Host *" defaults block first, so the specific
+# entry we add below lands above it (first-match-wins ordering).
+ensure_catchall_block
 
 TEMP_CONFIG=$(mktemp)
 
@@ -865,8 +996,10 @@ if [[ -f "$SSH_CONFIG" ]]; then
         if [[ $REPLY =~ ^[Yy]$ ]]; then
             backup_config
             # Remove the existing block, including the comment/blank lines that head it,
-            # then append the new entry. Buffered comment/blank lines are dropped when
-            # they belong to the removed block and flushed (kept) otherwise.
+            # then re-insert the new entry above the "Host *" catch-all. Buffered
+            # comment/blank lines are dropped when they belong to the removed block
+            # and flushed (kept) otherwise.
+            REMOVED=$(mktemp)
             awk -v host="$ALIAS" "$AWK_HOST_FUNCS"'
                 function flush() { printf "%s", buf; buf = "" }
                 /^[[:space:]]*#/ { if (skip) next; buf = buf $0 "\n"; next }
@@ -877,18 +1010,18 @@ if [[ -f "$SSH_CONFIG" ]]; then
                 }
                 { if (skip) next; flush(); print }
                 END { if (!skip) flush() }
-            ' "$SSH_CONFIG" > "$TEMP_CONFIG"
-            echo "$CONFIG_ENTRY" >> "$TEMP_CONFIG"
+            ' "$SSH_CONFIG" > "$REMOVED"
+            insert_config_entry "$REMOVED" "$TEMP_CONFIG"
+            rm -f "$REMOVED"
             mv "$TEMP_CONFIG" "$SSH_CONFIG"
             print_success "SSH config updated (replaced existing entry)"
         else
             print_info "SSH config left unchanged"
         fi
     else
-        # Add new entry
+        # Add new entry above the "Host *" catch-all (first-match-wins ordering)
         backup_config
-        cp "$SSH_CONFIG" "$TEMP_CONFIG"
-        echo "$CONFIG_ENTRY" >> "$TEMP_CONFIG"
+        insert_config_entry "$SSH_CONFIG" "$TEMP_CONFIG"
         mv "$TEMP_CONFIG" "$SSH_CONFIG"
         print_success "SSH config updated (new entry added)"
     fi
@@ -903,7 +1036,7 @@ chmod 600 "$SSH_CONFIG"
 
 # Test the connection
 print_info "Testing SSH connection..."
-if ssh -o ConnectTimeout=10 -o BatchMode=yes "$ALIAS" "echo 'SSH connection successful'" 2>/dev/null; then
+if ssh "${SSH_NOMUX[@]}" -o ConnectTimeout=10 -o BatchMode=yes "$ALIAS" "echo 'SSH connection successful'" 2>/dev/null; then
     print_success "SSH connection test passed!"
 else
     print_warning "SSH connection test failed. This might be normal if the server doesn't allow non-interactive connections."
