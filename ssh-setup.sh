@@ -765,6 +765,73 @@ if [ -s \"\$f.tmp\" ]; then mv \"\$f.tmp\" \"\$f\"; chmod 600 \"\$f\"; echo REMO
     return 0
 }
 
+# Preflight the target's SSH host identity BEFORE generating or copying a key.
+# The script's connections inherit the user's "Host *" settings, which may
+# include "StrictHostKeyChecking no" — so a name that has silently resolved to
+# the WRONG host (e.g. a DNS wildcard fall-through when its real record is
+# momentarily missing) would be trusted and handed our key. This catches that:
+# a CHANGED host key aborts, an UNKNOWN host key shows the fingerprint + resolved
+# IP and asks, and a host key that matches known_hosts proceeds quietly.
+verify_host_identity() {
+    local host="$1" port="$2" scan ips known_pairs scan_pairs changed=0 ktype kblob sblob reply
+
+    ips=$(getent hosts "$host" 2>/dev/null | awk '{print $1}' | sort -u | paste -sd', ' -)
+
+    # A raw protocol handshake (no auth, no ControlMaster) to read the host key.
+    scan=$(ssh-keyscan -T 7 -p "$port" "$host" 2>/dev/null)
+    if [[ -z "$scan" ]]; then
+        print_warning "Couldn't read $host's host key (host down or filtered) — skipping identity check."
+        return 0
+    fi
+    scan_pairs=$(awk '!/^#/ && NF>=3 { print $(NF-1), $NF }' <<< "$scan")
+
+    if ! known_pairs=$(ssh-keygen -F "$host" 2>/dev/null | awk '!/^#/ && NF>=3 { print $(NF-1), $NF }') \
+            || [[ -z "$known_pairs" ]]; then
+        # UNKNOWN host: normal for a genuine first-time setup, but also exactly what
+        # a fall-through to a brand-new wrong host looks like — surface and confirm.
+        print_warning "The host key for '$host' is not yet in known_hosts."
+        [[ -n "$ips" ]] && echo "  Resolves to: $ips"
+        echo "  Presented host key(s):"
+        printf '%s\n' "$scan" | ssh-keygen -lf - 2>/dev/null | sed 's/^/    /'
+        echo "  Make sure this is the host you expect — a bare name can resolve to a"
+        echo "  wildcard/ingress box if its real DNS record is momentarily missing."
+        read -rp "  Trust this host and continue? (y/N): " -n 1 reply || reply=""
+        echo
+        if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+            print_error "Aborted: host identity not confirmed for '$host'."
+            return 1
+        fi
+        return 0
+    fi
+
+    # Known host: detect a CHANGED key the way ssh does — a key type present in
+    # both known_hosts and the server's current offer whose material differs.
+    while read -r ktype kblob; do
+        [[ -z "$ktype" ]] && continue
+        sblob=$(awk -v t="$ktype" '$1 == t { print $2; exit }' <<< "$scan_pairs")
+        [[ -n "$sblob" && "$sblob" != "$kblob" ]] && changed=1
+    done <<< "$known_pairs"
+
+    if (( changed )); then
+        print_error "Host key for '$host' does NOT match ~/.ssh/known_hosts — refusing to continue."
+        [[ -n "$ips" ]] && echo "  '$host' currently resolves to: $ips"
+        echo "  Now presented:"
+        printf '%s\n' "$scan" | ssh-keygen -lf - 2>/dev/null | sed 's/^/    /'
+        echo "  Previously trusted:"
+        ssh-keygen -lF "$host" 2>/dev/null | grep -v '^#' | sed 's/^/    /'
+        echo
+        print_warning "This usually means one of:"
+        echo "    - the name resolved to a DIFFERENT host (e.g. DNS wildcard fall-through)"
+        echo "    - the server was legitimately reinstalled (new host key)"
+        echo "  Check where it points first:  getent hosts $host"
+        echo "  If the change is expected, clear the old key and retry:  ssh-keygen -R '$host'"
+        return 1
+    fi
+
+    print_info "Host key for '$host' verified against known_hosts."
+    return 0
+}
+
 # Default values (REMOTE_USER defaults to the local user once resolved below)
 REMOTE_USER=""
 REMOTE_USER_SET=false
@@ -1017,6 +1084,12 @@ echo "  Key File: $KEY_FILE"
 echo "  Comment: $COMMENT"
 echo "  SSH Config Alias: $ALIAS"
 echo
+
+# Confirm we're about to hand our key to the host we think we are — catching a
+# DNS fall-through or a changed host key before anything is generated or copied.
+if ! verify_host_identity "$HOST" "$PORT"; then
+    exit 1
+fi
 
 # Check if key already exists
 if [[ -f "$KEY_FILE" ]]; then

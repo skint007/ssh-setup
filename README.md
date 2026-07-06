@@ -313,6 +313,15 @@ it won't change values you've set.
 
 ## Behavior & safety
 
+- **The target's host identity is verified before anything is generated or
+  copied.** Setup reads the host key the target presents and compares it to
+  `known_hosts`: a **changed** key aborts (with a hint that the name may have
+  resolved to a different host — e.g. DNS wildcard fall-through — or the server
+  was reinstalled), an **unknown** key shows the fingerprint + resolved IP and
+  asks you to confirm, and a match proceeds quietly. This overrides an inherited
+  `StrictHostKeyChecking no` for the check, so a name that silently resolves to
+  the wrong box can't be handed your key. If the host is unreachable for the
+  probe, the check is skipped rather than blocking setup.
 - **Keys are generated without a passphrase** (`-N ""`) so connections are
   non-interactive. If you want a passphrase, generate the key manually or add
   one afterwards with `ssh-keygen -p -f <keyfile>`.
