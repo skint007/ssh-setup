@@ -62,10 +62,12 @@ usage() {
 Usage: $0 --host <hostname> [OPTIONS]          # set up a new key
        $0 --rotate --alias <name> [OPTIONS]    # rotate an existing key
        $0 --check-age [--max-age <days>]       # find keys due for rotation
+       $0 --remove-key --host <name> [OPTIONS] # remove a key from a server
 
 Generate an SSH key, copy it to a server, and update ~/.ssh/config.
 With --rotate, replace the key of an existing config entry in place.
 With --check-age, list managed keys by age and offer to rotate old ones.
+With --remove-key, delete a public key from a server's authorized_keys.
 
 OPTIONS:
     -h, --host          Target hostname or IP address (required for setup)
@@ -91,6 +93,15 @@ OPTIONS:
                         and offer to rotate any due for rotation
     --max-age           Days before a key counts as due for rotation
                         (default: 90; used with --check-age)
+    --remove-key        Remove a public key from a server's authorized_keys (the
+                        inverse of installing one). Target with --host or --alias
+                        (an --alias reuses the entry's HostName/User/Port and
+                        authenticates with its key). Refuses to remove the last
+                        remaining key so you can't lock yourself out.
+    --pubkey            Public key file to remove (with --remove-key).
+                        Default: ~/.ssh/id_ed25519.pub
+    --key               Literal public key string to remove instead of a file,
+                        e.g. --key 'ssh-ed25519 AAAA...' (with --remove-key)
     --help              Show this help message
 
 Note: -h means --host, not help. Use --help for this message.
@@ -101,6 +112,8 @@ EXAMPLES:
     $0 --host github.com --user git --alias github --name github
     $0 --rotate --alias homeserver
     $0 --check-age --max-age 180
+    $0 --remove-key --host homeserver                        # remove your default key
+    $0 --remove-key --alias homeserver --pubkey ~/.ssh/id_ed25519_old.pub
     sudo $0 --host example.com --local-user skint007
 
 EOF
@@ -669,6 +682,89 @@ do_rotate() {
     return 0
 }
 
+# Remove a public key from a server's authorized_keys — the inverse of the
+# install step. Target the host by --host (or --alias, which reads
+# HostName/User/Port from ~/.ssh/config); pick the key to remove with --pubkey
+# <file> or --key '<literal>' (default: ~/.ssh/id_ed25519.pub). Matching is on
+# the key's base64 blob, so the comment is irrelevant, and the server refuses to
+# empty authorized_keys (so you can't strand yourself without any key).
+do_remove_key() {
+    local target hostname user port auth_key pub blob desc result
+    local ssh_auth=()
+
+    target="${ALIAS:-$HOST}"
+    if [[ -z "$target" ]]; then
+        print_error "Remove-key needs a target. Use --host <host> or --alias <name>."
+        return 1
+    fi
+
+    # Prefer a matching config entry (for HostName/User/Port and an identity to
+    # authenticate with); otherwise fall back to the --host/--user/--port flags.
+    if [[ -f "$SSH_CONFIG" ]] && host_exists "$target" "$SSH_CONFIG"; then
+        hostname=$(config_get "$target" HostName); hostname="${hostname:-$target}"
+        user=$(config_get "$target" User);         user="${user:-$REMOTE_USER}"
+        port=$(config_get "$target" Port);         port="${port:-$PORT}"
+        auth_key=$(config_get "$target" IdentityFile); auth_key="${auth_key/#\~/$HOME}"
+    else
+        hostname="$target"; user="$REMOTE_USER"; port="$PORT"; auth_key=""
+    fi
+
+    # Resolve the key blob to remove: a literal string wins, else a .pub file.
+    if [[ -n "$REMOVE_KEY_LITERAL" ]]; then
+        blob=$(awk '{print ($2 != "" ? $2 : $1)}' <<< "$REMOVE_KEY_LITERAL")
+        desc="(literal key)"
+    else
+        pub="${REMOVE_PUBKEY:-$HOME/.ssh/id_ed25519.pub}"
+        pub="${pub/#\~/$HOME}"
+        if [[ ! -f "$pub" ]]; then
+            print_error "Public key file not found: $pub"
+            print_info "Pass --pubkey <file> or --key '<ssh-... AAAA...>'."
+            return 1
+        fi
+        blob=$(awk '{print $2}' "$pub")
+        desc="$pub"
+    fi
+    if [[ -z "$blob" ]]; then
+        print_error "Could not read a key blob to remove from ${desc}."
+        return 1
+    fi
+
+    # Authenticate with the entry's own key when we have one, so we're not
+    # relying on (and possibly about to remove) the key being deleted.
+    if [[ -n "$auth_key" && -f "$auth_key" ]]; then
+        ssh_auth=(-i "$auth_key" -o IdentitiesOnly=yes)
+    fi
+
+    print_info "Removing key from $user@$hostname:$port"
+    echo "  Key: $desc"
+
+    # -n keeps ssh off our stdin (safe if ever called in a loop); no BatchMode,
+    # so a passphrase/password prompt can still appear for the auth key.
+    # REMOVED / ABSENT / ONLYKEY / NOFILE are reported back for an honest result.
+    local remote_rm="f=\$HOME/.ssh/authorized_keys
+if [ ! -f \"\$f\" ]; then echo NOFILE; exit 0; fi
+if ! grep -qF '$blob' \"\$f\"; then echo ABSENT; exit 0; fi
+grep -vF '$blob' \"\$f\" > \"\$f.tmp\" 2>/dev/null || true
+if [ -s \"\$f.tmp\" ]; then mv \"\$f.tmp\" \"\$f\"; chmod 600 \"\$f\"; echo REMOVED; else rm -f \"\$f.tmp\"; echo ONLYKEY; fi"
+
+    if ! result=$(ssh "${SSH_NOMUX[@]}" -n "${ssh_auth[@]}" -p "$port" \
+            -o ConnectTimeout=10 "$user@$hostname" "$remote_rm"); then
+        print_error "Could not connect to $user@$hostname:$port to remove the key."
+        return 1
+    fi
+
+    case "$result" in
+        REMOVED) print_success "Key removed from $user@$hostname." ;;
+        ABSENT)  print_info "That key isn't in authorized_keys on $user@$hostname — nothing to do." ;;
+        NOFILE)  print_info "No authorized_keys file on $user@$hostname — nothing to do." ;;
+        ONLYKEY) print_warning "That key is the ONLY authorized key on $user@$hostname — refused (removing it would lock you out)."
+                 print_warning "Add another key first, or remove it by hand if you're sure."
+                 return 1 ;;
+        *)       print_warning "Unexpected response from $user@$hostname: ${result:-<empty>}"; return 1 ;;
+    esac
+    return 0
+}
+
 # Default values (REMOTE_USER defaults to the local user once resolved below)
 REMOTE_USER=""
 REMOTE_USER_SET=false
@@ -683,6 +779,9 @@ ROTATE=false
 CHECK_AGE=false
 MAX_AGE_DAYS=90
 LOCAL_USER=""
+REMOVE_KEY=false
+REMOVE_PUBKEY=""
+REMOVE_KEY_LITERAL=""
 
 # Keep the original arguments so we can re-exec as the target user unchanged
 # (minus --local-user) when installing on someone else's behalf.
@@ -735,6 +834,26 @@ while [[ $# -gt 0 ]]; do
         --check-age)
             CHECK_AGE=true
             shift
+            ;;
+        --remove-key)
+            REMOVE_KEY=true
+            shift
+            ;;
+        --pubkey)
+            if [[ $# -lt 2 ]]; then
+                print_error "--pubkey requires a path to a .pub file."
+                exit 1
+            fi
+            REMOVE_PUBKEY="$2"
+            shift 2
+            ;;
+        --key)
+            if [[ $# -lt 2 ]]; then
+                print_error "--key requires a public key string (e.g. 'ssh-ed25519 AAAA...')."
+                exit 1
+            fi
+            REMOVE_KEY_LITERAL="$2"
+            shift 2
             ;;
         --max-age)
             if [[ $# -lt 2 ]]; then
@@ -823,6 +942,12 @@ fi
 # HostName/User/Port/IdentityFile from ~/.ssh/config), then exit.
 if [[ "$ROTATE" == true ]]; then
     do_rotate
+    exit $?
+fi
+
+# Remove-key mode: delete a public key from a server's authorized_keys, then exit.
+if [[ "$REMOVE_KEY" == true ]]; then
+    do_remove_key
     exit $?
 fi
 

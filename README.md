@@ -20,6 +20,10 @@ Every key it creates or rotates is stamped with a date tag in the key comment
 tags back to tell you which keys are due for rotation — and offers to rotate
 them on the spot. See [Checking key ages](#checking-key-ages).
 
+It can also **remove** a public key from a server's `authorized_keys` — the
+inverse of `ssh-copy-id`, with a guard against locking yourself out. See
+[Removing a key](#removing-a-key).
+
 ## Requirements
 
 - Bash 4+
@@ -216,6 +220,36 @@ and the batch continues on to the remaining keys. Keys made before this feature
 existed (no date tag in the comment) fall back to the private key file's
 modification time, which is accurate for any key this script generated or
 rotated. Glob entries (`Host *.example.com`) are skipped.
+
+## Removing a key
+
+The inverse of installing a key — delete a public key from a server's
+`authorized_keys`. Useful after you've set up a dedicated key for a host and want
+to stop a shared/default key from granting access there:
+
+```bash
+# Remove your default key (~/.ssh/id_ed25519.pub) from a host
+ssh-setup --remove-key --host homeserver
+
+# Target by config alias (reuses its HostName/User/Port and authenticates with
+# the entry's own key), and remove a specific key file
+ssh-setup --remove-key --alias homeserver --pubkey ~/.ssh/id_ed25519_old.pub
+
+# Remove a key you only have as a string (e.g. one you spotted in authorized_keys)
+ssh-setup --remove-key --host homeserver --key 'ssh-ed25519 AAAA...'
+```
+
+- **Matches on the key's base64 material**, so the comment doesn't matter and it
+  can't remove the wrong line.
+- **Refuses to remove the last remaining key** — the server won't empty its
+  `authorized_keys`, so you can't accidentally lock yourself out.
+- **Reports honestly**: `removed`, `key isn't present`, or `refused (only key)`.
+- When you use `--alias`, it authenticates with that entry's key — so you're not
+  relying on (or about to delete) the very key you're removing.
+
+> ⚠️ Remove a shared/default key only **after** the host's dedicated key is set
+> up and verified working — otherwise you may drop your last way in. There's no
+> standard `ssh-remove-id`; this fills that gap.
 
 ## What it creates
 
