@@ -63,11 +63,13 @@ Usage: $0 --host <hostname> [OPTIONS]          # set up a new key
        $0 --rotate --alias <name> [OPTIONS]    # rotate an existing key
        $0 --check-age [--max-age <days>]       # find keys due for rotation
        $0 --remove-key --host <name> [OPTIONS] # remove a key from a server
+       $0 --bootstrap <machine> --host <name>  # set up ANOTHER machine's access
 
 Generate an SSH key, copy it to a server, and update ~/.ssh/config.
 With --rotate, replace the key of an existing config entry in place.
 With --check-age, list managed keys by age and offer to rotate old ones.
 With --remove-key, delete a public key from a server's authorized_keys.
+With --bootstrap, give a different machine access to servers this one can reach.
 
 OPTIONS:
     -h, --host          Target hostname or IP address (required for setup)
@@ -102,6 +104,17 @@ OPTIONS:
                         Default: ~/.ssh/id_ed25519.pub
     --key               Literal public key string to remove instead of a file,
                         e.g. --key 'ssh-ed25519 AAAA...' (with --remove-key)
+    --bootstrap         Machine to set up access FOR, using this machine's
+                        existing access to the servers. The keypair is generated
+                        on that machine (no private key is ever copied), the
+                        public key is installed on each server from here, the
+                        Host entry is written on that machine, and the machine
+                        itself verifies the connection. Target servers with
+                        --host and/or --hosts-file.
+    --hosts-file        File listing servers to bootstrap, one "[user@]host[:port]"
+                        per line; blank lines and "#" comments are ignored
+    --domain            Domain suffix appended to any bare (dotless) server name,
+                        e.g. --domain tail1234.ts.net
     --help              Show this help message
 
 Note: -h means --host, not help. Use --help for this message.
@@ -114,6 +127,8 @@ EXAMPLES:
     $0 --check-age --max-age 180
     $0 --remove-key --host homeserver                        # remove your default key
     $0 --remove-key --alias homeserver --pubkey ~/.ssh/id_ed25519_old.pub
+    $0 --bootstrap newbox --host server1 --alias server1
+    $0 --bootstrap newbox --hosts-file servers.txt --domain tail1234.ts.net
     sudo $0 --host example.com --local-user skint007
 
 EOF
@@ -765,6 +780,517 @@ if [ -s \"\$f.tmp\" ]; then mv \"\$f.tmp\" \"\$f\"; chmod 600 \"\$f\"; echo REMO
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# Bootstrap mode: set up ANOTHER machine's key access to servers that THIS
+# machine can already reach. Solves the chicken-and-egg problem of a brand new
+# machine and a fleet with "PasswordAuthentication no": there is no way in to
+# run ssh-copy-id from, so the key has to be placed using an existing machine's
+# working access. The private key is generated on the new machine and never
+# leaves it — only the .pub travels.
+# ---------------------------------------------------------------------------
+
+# Names that get interpolated into the remote shell snippets below are limited
+# to characters with no meaning to a shell, so nothing needs quoting on the far
+# side and a stray hosts-file line can't smuggle in a command.
+valid_name() {
+    [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+# Split a target spec "[user@]host[:port]" into SPEC_USER/SPEC_NAME/SPEC_PORT,
+# appending --domain to a bare (dotless) name. Used both per host and up front,
+# so the alias a batch will derive is known before anything is touched.
+SPEC_USER=""
+SPEC_NAME=""
+SPEC_PORT=""
+parse_target_spec() {
+    local s="$1"
+    SPEC_USER=""
+    SPEC_PORT=""
+    if [[ "$s" == *@* ]]; then SPEC_USER="${s%%@*}"; s="${s#*@}"; fi
+    if [[ "$s" == *:* ]]; then SPEC_PORT="${s##*:}"; s="${s%:*}"; fi
+    if [[ -n "$DOMAIN" && "$s" != *.* ]]; then s="$s.$DOMAIN"; fi
+    SPEC_NAME="$s"
+}
+
+# Ask ssh itself what it would use for a name, into CFG_USER/CFG_HOSTNAME/
+# CFG_PORT. "ssh -G" applies the whole config the way a real connection would —
+# including wildcard patterns ("Host *.example.com") and Match blocks, which an
+# exact-alias lookup misses, and which is exactly how fleets tend to be
+# configured. For a name with no config at all it just echoes back the defaults.
+CFG_USER=""
+CFG_HOSTNAME=""
+CFG_PORT=""
+CFG_PROXYJUMP=""
+CFG_PROXYCOMMAND=""
+resolve_ssh_config() {
+    local g
+    CFG_USER=""; CFG_HOSTNAME=""; CFG_PORT=""; CFG_PROXYJUMP=""; CFG_PROXYCOMMAND=""
+    g=$(ssh -G "$1" 2>/dev/null) || return 1
+    CFG_USER=$(awk 'tolower($1) == "user" { print $2; exit }' <<< "$g")
+    CFG_HOSTNAME=$(awk 'tolower($1) == "hostname" { print $2; exit }' <<< "$g")
+    CFG_PORT=$(awk 'tolower($1) == "port" { print $2; exit }' <<< "$g")
+    # Only printed when actually set, so a value here means the connection goes
+    # through a proxy — which the machine we're bootstrapping has to reproduce.
+    CFG_PROXYJUMP=$(awk 'tolower($1) == "proxyjump" { $1 = ""; sub(/^[[:space:]]+/, ""); print; exit }' <<< "$g")
+    CFG_PROXYCOMMAND=$(awk 'tolower($1) == "proxycommand" { $1 = ""; sub(/^[[:space:]]+/, ""); print; exit }' <<< "$g")
+    [[ -n "$CFG_HOSTNAME" ]]
+}
+
+# Generate the key on the new machine if it isn't already there (re-running the
+# batch reuses it), then print "GENERATED"/"REUSED" and the public key.
+# Expects: keyfile, keytype, keybits, target_host, today.
+read -r -d '' REMOTE_GEN_SH <<'REMOTE_GEN_EOF' || true
+set -e
+umask 077
+mkdir -p "$HOME/.ssh"
+chmod 700 "$HOME/.ssh"
+k="$HOME/.ssh/$keyfile"
+if [ -f "$k" ]; then
+    status=REUSED
+else
+    c="$(id -un)@$(hostname 2>/dev/null || uname -n)_to_${target_host} (created ${today})"
+    if [ "$keytype" = ed25519 ]; then
+        ssh-keygen -t ed25519 -N '' -C "$c" -f "$k" >/dev/null
+    else
+        ssh-keygen -t "$keytype" -b "$keybits" -N '' -C "$c" -f "$k" >/dev/null
+    fi
+    status=GENERATED
+fi
+[ -f "$k.pub" ] || ssh-keygen -y -f "$k" > "$k.pub"
+chmod 600 "$k"
+chmod 644 "$k.pub"
+printf '%s\n' "$status"
+cat "$k.pub"
+REMOTE_GEN_EOF
+
+# Append the public key (read from stdin) to the target server's
+# authorized_keys, unless the same key material is already there. Matching is on
+# the base64 blob, not the whole line, so a re-run with a different comment
+# doesn't add a duplicate.
+read -r -d '' REMOTE_ADD_KEY_SH <<'REMOTE_ADD_EOF' || true
+set -e
+umask 077
+newkey=$(cat)
+blob=$(printf '%s\n' "$newkey" | awk '{print $2}')
+if [ -z "$blob" ]; then printf 'BADKEY\n'; exit 0; fi
+mkdir -p "$HOME/.ssh"
+chmod 700 "$HOME/.ssh"
+f="$HOME/.ssh/authorized_keys"
+[ -f "$f" ] || : > "$f"
+if awk -v b="$blob" '{ for (i = 1; i <= NF; i++) if ($i == b) found = 1 } END { exit found ? 0 : 1 }' "$f"; then
+    chmod 600 "$f"
+    printf 'PRESENT\n'
+else
+    printf '%s\n' "$newkey" >> "$f"
+    chmod 600 "$f"
+    printf 'ADDED\n'
+fi
+REMOTE_ADD_EOF
+
+# Write the Host entry (read from stdin) into the new machine's ~/.ssh/config:
+# drop any existing block for the same alias, then insert above the first
+# "Host *" catch-all — the same first-match-wins ordering the local path uses.
+# Expects: alias_name, do_backup.
+read -r -d '' REMOTE_CONFIG_SH <<'REMOTE_CONFIG_EOF' || true
+set -e
+umask 077
+entry=$(cat)
+cfg="$HOME/.ssh/config"
+mkdir -p "$HOME/.ssh"
+chmod 700 "$HOME/.ssh"
+# ~/.ssh/config is often a symlink into a dotfiles repo. Resolve it and write
+# THROUGH the link (cat >), so the link isn't replaced by a regular file and the
+# dotfiles copy left orphaned.
+real="$cfg"
+if [ -L "$cfg" ]; then
+    real=$(readlink -f "$cfg" 2>/dev/null) || real="$cfg"
+    [ -n "$real" ] || real="$cfg"
+fi
+[ -f "$real" ] || : > "$real"
+if [ "$do_backup" = 1 ] && [ -s "$real" ]; then
+    cp "$real" "$real.backup.$(date +%Y%m%d_%H%M%S)"
+fi
+t1=$(mktemp)
+t2=$(mktemp)
+awk -v host="$alias_name" '
+    function host_line_matches(host,   i) {
+        for (i = 2; i <= NF; i++) if ($i == host) return 1
+        return 0
+    }
+    function flush() { printf "%s", buf; buf = "" }
+    # A Host/Match line is the only thing that ends a block: an ssh_config block
+    # runs to the next one, blank lines and comments included.
+    /^[[:space:]]*[Hh]ost[[:space:]]/ {
+        skip = 0
+        if (host_line_matches(host)) {
+            # A grouped "Host a b" line still serves its other aliases, so drop
+            # only ours from it and keep the block; removing the whole thing
+            # would silently take those siblings with it.
+            rest = ""
+            for (i = 2; i <= NF; i++) if ($i != host) rest = rest " " $i
+            if (rest != "") { flush(); print $1 rest; next }
+            skip = 1; buf = ""; next
+        }
+        flush(); print; next
+    }
+    /^[[:space:]]*[Mm]atch[[:space:]]/ { skip = 0; flush(); print; next }
+    # Comments and blank lines are buffered rather than emitted: a run of them
+    # directly above a block heads THAT block, so it has to survive even when it
+    # sits inside the one being removed. A directive line proves the run was
+    # interior to the removed block, so it is dropped there.
+    /^[[:space:]]*#/ || /^[[:space:]]*$/ { buf = buf $0 "\n"; next }
+    { if (skip) { buf = ""; next } flush(); print }
+    END { if (!skip) flush() }
+' "$real" > "$t1"
+ENTRY="$entry" awk '
+    function is_catchall(   i) { for (i = 2; i <= NF; i++) if ($i == "*") return 1; return 0 }
+    { lines[NR] = $0 }
+    !done && /^[[:space:]]*[Hh]ost[[:space:]]/ && is_catchall() {
+        insat = (runstart > 0 ? runstart : NR); done = 1
+    }
+    /^[[:space:]]*#/ || /^[[:space:]]*$/ { if (runstart == 0) runstart = NR; next }
+    { runstart = 0 }
+    END {
+        for (k = 1; k <= NR; k++) {
+            if (done && k == insat) print ENVIRON["ENTRY"]
+            print lines[k]
+        }
+        if (!done) print ENVIRON["ENTRY"]
+    }
+' "$t1" > "$t2"
+cat "$t2" > "$real"
+chmod 600 "$real"
+rm -f "$t1" "$t2"
+printf 'WROTE\n'
+REMOTE_CONFIG_EOF
+
+# Connections to the machine being bootstrapped go over a control socket THIS
+# run creates in a private temp dir: one authentication for the whole batch (the
+# machine may only be reachable by password yet), with no risk of riding a
+# pre-existing master socket that points somewhere else.
+BOOTSTRAP_CTL_DIR=""
+bootstrap_cleanup() {
+    [[ -n "$BOOTSTRAP_CTL_DIR" ]] || return 0
+    ssh -o ControlPath="$BOOTSTRAP_CTL_DIR/ctl" -O exit "$BOOTSTRAP" >/dev/null 2>&1 || true
+    rm -rf "$BOOTSTRAP_CTL_DIR"
+    BOOTSTRAP_CTL_DIR=""
+}
+
+machine_ssh() {
+    ssh -o ControlMaster=auto -o ControlPath="$BOOTSTRAP_CTL_DIR/ctl" -o ControlPersist=60 \
+        -o ConnectTimeout=15 "$BOOTSTRAP" "$@"
+}
+
+# Bootstrap one server. Every failure is local to this host: it returns non-zero
+# and the batch carries on with the next one.
+BOOTSTRAP_CONFIG_BACKED_UP=false
+BOOTSTRAP_FAIL_REASON=""
+bootstrap_one() {
+    local spec="$1"
+    local name user port hostname alias key_prefix key_base pub comment
+    local out status entry do_backup
+
+    BOOTSTRAP_FAIL_REASON=""
+
+    parse_target_spec "$spec"
+    name="$SPEC_NAME"
+    user="$SPEC_USER"
+    port="$SPEC_PORT"
+
+    if ! valid_name "$name"; then
+        BOOTSTRAP_FAIL_REASON="invalid host name '$name'"
+        return 1
+    fi
+    if [[ -n "$user" ]] && ! valid_name "$user"; then
+        BOOTSTRAP_FAIL_REASON="invalid user name '$user'"
+        return 1
+    fi
+    if [[ -n "$port" ]] && ! [[ "$port" =~ ^[0-9]+$ ]]; then
+        BOOTSTRAP_FAIL_REASON="invalid port '$port'"
+        return 1
+    fi
+
+    # Take the settings this machine already uses for the server — they are what
+    # the new machine needs in its own config, and they let ssh authenticate here
+    # with the identity that already works. Explicit values win over the config:
+    # a spec's user@/:port first, then --user/--port, then what ssh resolves.
+    if resolve_ssh_config "$name"; then
+        hostname="$CFG_HOSTNAME"
+        if [[ -z "$user" ]]; then
+            [[ "$REMOTE_USER_SET" == true ]] && user="$REMOTE_USER" || user="$CFG_USER"
+        fi
+        if [[ -z "$port" ]]; then
+            [[ "$PORT_SET" == true ]] && port="$PORT" || port="$CFG_PORT"
+        fi
+    else
+        hostname="$name"
+    fi
+    user="${user:-$REMOTE_USER}"
+    port="${port:-$PORT}"
+    if ! valid_name "$hostname"; then
+        BOOTSTRAP_FAIL_REASON="invalid HostName '$hostname'"
+        return 1
+    fi
+
+    # Connect by NAME so any config for it (identity, ProxyJump, wildcard block)
+    # still applies, but pin the user and port to what we resolved — otherwise a
+    # spec like "otheruser@server:2222" would install the key into the account
+    # the config names while the entry we write points somewhere else.
+    local ssh_target=(-l "$user" -p "$port" "$name")
+
+    # A ProxyCommand is a command line for THIS machine — the other one may not
+    # have the binary, the socket or the credentials it needs, and we'd only find
+    # out after the key was already installed. Refuse before touching the server.
+    if [[ -n "$CFG_PROXYCOMMAND" ]]; then
+        BOOTSTRAP_FAIL_REASON="reached through a ProxyCommand, which can't be reproduced on $BOOTSTRAP — set that host up by hand"
+        return 1
+    fi
+
+    # One alias per server on the new machine: --alias when a single --host was
+    # given, otherwise the short name (first label) of the server.
+    alias="$ALIAS"
+    [[ -n "$alias" ]] || alias="${name%%.*}"
+    if ! valid_name "$alias"; then
+        BOOTSTRAP_FAIL_REASON="invalid alias '$alias'"
+        return 1
+    fi
+
+    case "$KEY_TYPE" in
+        ed25519) key_prefix="id_ed25519" ;;
+        rsa)     key_prefix="id_rsa" ;;
+        ecdsa)   key_prefix="id_ecdsa" ;;
+    esac
+    key_base="${key_prefix}_${KEY_NAME:-$alias}"
+    if ! valid_name "$key_base"; then
+        BOOTSTRAP_FAIL_REASON="invalid key name '${KEY_NAME:-$alias}'"
+        return 1
+    fi
+
+    print_info "Bootstrapping $BOOTSTRAP -> $user@$hostname:$port (alias '$alias')"
+
+    # Confirm the server we're about to add a key to is the host we think it is,
+    # before anything is generated or written.
+    if ! verify_host_identity "$hostname" "$port"; then
+        BOOTSTRAP_FAIL_REASON="host identity not confirmed"
+        return 1
+    fi
+
+    # 1. Generate the key ON the new machine. The private key never moves.
+    if ! out=$(machine_ssh "keyfile=$key_base keytype=$KEY_TYPE keybits=$KEY_BITS target_host=$name today=$(date +%Y-%m-%d)
+$REMOTE_GEN_SH" </dev/null); then
+        BOOTSTRAP_FAIL_REASON="could not generate the key on $BOOTSTRAP"
+        return 1
+    fi
+    status=$(head -n1 <<< "$out")
+    pub=$(sed -n '2p' <<< "$out")
+    if [[ -z "$pub" || "$pub" != ssh-* && "$pub" != ecdsa-* && "$pub" != sk-* ]]; then
+        BOOTSTRAP_FAIL_REASON="no public key returned from $BOOTSTRAP"
+        return 1
+    fi
+    case "$status" in
+        GENERATED) print_success "  Key generated on $BOOTSTRAP: ~/.ssh/$key_base" ;;
+        *)         print_info "  Reusing existing key on $BOOTSTRAP: ~/.ssh/$key_base" ;;
+    esac
+
+    # 2. Install the public key on the server, using THIS machine's access.
+    if ! out=$(ssh "${SSH_NOMUX[@]}" -o ConnectTimeout=15 "${ssh_target[@]}" \
+            "$REMOTE_ADD_KEY_SH" <<< "$pub"); then
+        BOOTSTRAP_FAIL_REASON="could not reach $user@$hostname:$port from here"
+        return 1
+    fi
+    case "$out" in
+        ADDED)   print_success "  Public key added to $user@$hostname:$port" ;;
+        PRESENT) print_info "  Public key already in authorized_keys on $user@$hostname:$port" ;;
+        *)       BOOTSTRAP_FAIL_REASON="unexpected response installing the key: ${out:-<empty>}"
+                 return 1 ;;
+    esac
+
+    # 3. Write the Host entry on the new machine (~ is expanded by ssh there, so
+    #    we don't need to know its home directory).
+    comment=$(cut -d' ' -f3- <<< "$pub")
+    entry="
+# ${comment:-$alias}
+Host $alias
+    HostName $hostname
+    User $user
+    Port $port"
+    # This machine only reaches the server through a jump host, so the entry is
+    # useless without it. Carry it over — but the new machine needs its own
+    # access to that jump host, which is a separate bootstrap.
+    if [[ -n "$CFG_PROXYJUMP" ]]; then
+        entry="$entry
+    ProxyJump $CFG_PROXYJUMP"
+        print_warning "  This server is reached via ProxyJump $CFG_PROXYJUMP — $BOOTSTRAP needs its own access to that jump host."
+    fi
+    entry="$entry
+    IdentityFile ~/.ssh/$key_base
+    IdentitiesOnly yes
+"
+    do_backup=0
+    [[ "$BOOTSTRAP_CONFIG_BACKED_UP" == false ]] && do_backup=1
+    if ! out=$(machine_ssh "alias_name=$alias do_backup=$do_backup
+$REMOTE_CONFIG_SH" <<< "$entry") || [[ "$out" != WROTE ]]; then
+        BOOTSTRAP_FAIL_REASON="key installed, but the SSH config entry on $BOOTSTRAP failed"
+        return 1
+    fi
+    BOOTSTRAP_CONFIG_BACKED_UP=true
+    print_success "  SSH config entry '$alias' written on $BOOTSTRAP"
+
+    # 4. Verify the way the user will actually connect: "ssh <alias>" ON the new
+    #    machine. A bare "-i key user@host" probe would bypass the entry we just
+    #    wrote — an earlier Host/Match rule there can shadow it (first-match-wins)
+    #    and send the alias to another account or host, which the probe would
+    #    never notice. ControlPath=none stops an already-open multiplexed session
+    #    from making a broken key look fine, and the entry's own IdentitiesOnly
+    #    keeps some other key from being what actually authenticates.
+    out=$(machine_ssh "ssh -o ControlPath=none -o BatchMode=yes \
+            -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 \
+            $alias 'id -un'" </dev/null 2>/dev/null) || out=""
+    out="${out//[$'\r\n']/}"
+    if [[ -z "$out" ]]; then
+        BOOTSTRAP_FAIL_REASON="'ssh $alias' on $BOOTSTRAP could not connect to $user@$hostname:$port with the new key"
+        return 1
+    fi
+    if [[ "$out" != "$user" ]]; then
+        BOOTSTRAP_FAIL_REASON="'ssh $alias' on $BOOTSTRAP lands on account '$out', not '$user' — an earlier Host/Match rule there is shadowing the new entry"
+        return 1
+    fi
+    print_success "  Verified: $BOOTSTRAP can now 'ssh $alias'"
+    return 0
+}
+
+# Drive the bootstrap over one or many servers, failing per host rather than
+# per run, and print a summary at the end.
+do_bootstrap() {
+    local targets=() line spec ok=() failed=()
+    local name reason
+
+    case "$KEY_TYPE" in
+        ed25519|rsa) ;;
+        # --bits defaults to an RSA size; ECDSA only accepts 256/384/521, so an
+        # untouched default would fail on the far side. Match the setup path's 521.
+        ecdsa) [[ "$KEY_BITS" == 4096 ]] && KEY_BITS=521 ;;
+        *) print_error "Invalid key type: $KEY_TYPE. Supported types: ed25519, rsa, ecdsa"
+           return 1 ;;
+    esac
+
+    if [[ -n "$HOSTS_FILE" ]]; then
+        if [[ ! -f "$HOSTS_FILE" ]]; then
+            print_error "Hosts file not found: $HOSTS_FILE"
+            return 1
+        fi
+        # Read the whole list up front so stdin stays the terminal — the host
+        # identity check below may need to ask a question.
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            line="${line%%#*}"
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            [[ -n "$line" ]] && targets+=("$line")
+        done < "$HOSTS_FILE"
+    fi
+    [[ -n "$HOST" ]] && targets+=("$HOST")
+
+    if (( ${#targets[@]} == 0 )); then
+        print_error "Bootstrap needs at least one server. Use --host <server> or --hosts-file <file>."
+        return 1
+    fi
+    if [[ -n "$ALIAS" && ${#targets[@]} -gt 1 ]]; then
+        print_error "--alias applies to a single server; with multiple servers the alias is derived from each name."
+        return 1
+    fi
+    if [[ -n "$KEY_NAME" && ${#targets[@]} -gt 1 ]]; then
+        print_error "--name applies to a single server; with multiple servers the key name is derived from each alias."
+        return 1
+    fi
+
+    # Derived aliases have to be unique. "web.prod.example.com" and
+    # "web.staging.example.com" both shorten to "web", which would share one key
+    # and overwrite each other's config entry while the summary claimed both
+    # succeeded — catch it before anything is written.
+    if [[ -z "$ALIAS" && ${#targets[@]} -gt 1 ]]; then
+        local dupes
+        dupes=$(for spec in "${targets[@]}"; do
+                    parse_target_spec "$spec"; printf '%s\n' "${SPEC_NAME%%.*}"
+                done | sort | uniq -d)
+        if [[ -n "$dupes" ]]; then
+            print_error "These servers shorten to the same alias, so they'd overwrite each other:"
+            while IFS= read -r line; do echo "    $line"; done <<< "$dupes"
+            print_info "Bootstrap them one at a time with --host <server> --alias <unique-name>."
+            return 1
+        fi
+    fi
+
+    print_info "Bootstrapping SSH access for '$BOOTSTRAP' to ${#targets[@]} server(s)."
+    echo "  Keys are generated on '$BOOTSTRAP' — no private key is ever copied."
+    echo
+
+    # Confirm the machine we're about to run commands on is the one we mean,
+    # BEFORE any remote code runs. If the name resolved to the wrong box (or a
+    # spoofed one), it would otherwise hand us a public key that we'd then go
+    # and install on every server in the batch.
+    local m_host m_port
+    if resolve_ssh_config "$BOOTSTRAP"; then
+        m_host="$CFG_HOSTNAME"; m_port="${CFG_PORT:-22}"
+    else
+        m_host="$BOOTSTRAP"; m_port=22
+    fi
+    if ! verify_host_identity "$m_host" "$m_port"; then
+        print_error "Aborting: the identity of '$BOOTSTRAP' could not be confirmed."
+        return 1
+    fi
+
+    BOOTSTRAP_CTL_DIR=$(mktemp -d)
+    trap bootstrap_cleanup EXIT
+    trap 'bootstrap_cleanup; exit 130' INT
+    trap 'bootstrap_cleanup; exit 143' TERM
+
+    # One connection up front: it opens the shared control socket (so a password
+    # prompt happens at most once) and proves the machine has everything the
+    # later steps need — including the ssh CLIENT, which the final verification
+    # runs. Checking it here means a machine with sshd but no client can't get
+    # halfway through and leave a key installed on servers it can't use.
+    if ! machine_ssh 'command -v ssh >/dev/null && command -v ssh-keygen >/dev/null &&
+            command -v awk >/dev/null && command -v mktemp >/dev/null' </dev/null; then
+        print_error "Cannot reach '$BOOTSTRAP', or it lacks ssh/ssh-keygen/awk/mktemp."
+        print_info "The machine being bootstrapped must be reachable from here (password auth is fine)."
+        return 1
+    fi
+
+    for spec in "${targets[@]}"; do
+        if bootstrap_one "$spec"; then
+            ok+=("$spec")
+        else
+            print_error "  Failed: ${BOOTSTRAP_FAIL_REASON:-unknown error}"
+            failed+=("$spec	${BOOTSTRAP_FAIL_REASON:-unknown error}")
+        fi
+        echo
+    done
+
+    print_info "Bootstrap summary for '$BOOTSTRAP':"
+    for spec in ${ok[@]+"${ok[@]}"}; do
+        echo -e "  ${GREEN}ok${NC}      $spec"
+    done
+    for spec in ${failed[@]+"${failed[@]}"}; do
+        IFS=$'\t' read -r name reason <<< "$spec"
+        echo -e "  ${RED}failed${NC}  $name — $reason"
+    done
+    echo
+    if (( ${#failed[@]} == 0 )); then
+        print_success "${#ok[@]} of ${#targets[@]} server(s) bootstrapped."
+    else
+        print_warning "${#ok[@]} of ${#targets[@]} server(s) bootstrapped; ${#failed[@]} failed."
+    fi
+
+    if (( ${#ok[@]} > 0 )); then
+        echo
+        print_info "'$BOOTSTRAP' now has its own key on each server above. If you had put a"
+        print_info "shared key on them to get this far, it is now redundant — remove it with:"
+        echo "  ssh-setup --remove-key --host <server> --pubkey ~/.ssh/<shared-key>.pub"
+    fi
+
+    (( ${#failed[@]} == 0 ))
+}
+
 # Preflight the target's SSH host identity BEFORE generating or copying a key.
 # The script's connections inherit the user's "Host *" settings, which may
 # include "StrictHostKeyChecking no" — so a name that has silently resolved to
@@ -774,6 +1300,12 @@ if [ -s \"\$f.tmp\" ]; then mv \"\$f.tmp\" \"\$f\"; chmod 600 \"\$f\"; echo REMO
 # IP and asks, and a host key that matches known_hosts proceeds quietly.
 verify_host_identity() {
     local host="$1" port="$2" scan ips known_pairs scan_pairs changed=0 ktype kblob sblob reply
+    local known_target="$host"
+
+    # OpenSSH files a host reached on a non-default port under "[host]:port", so
+    # a bare-name lookup for one of those finds nothing and a CHANGED key would
+    # read as a merely unknown host — which is a prompt, not a refusal.
+    [[ "$port" != 22 ]] && known_target="[$host]:$port"
 
     ips=$(getent hosts "$host" 2>/dev/null | awk '{print $1}' | sort -u | paste -sd', ' -)
 
@@ -785,7 +1317,7 @@ verify_host_identity() {
     fi
     scan_pairs=$(awk '!/^#/ && NF>=3 { print $(NF-1), $NF }' <<< "$scan")
 
-    if ! known_pairs=$(ssh-keygen -F "$host" 2>/dev/null | awk '!/^#/ && NF>=3 { print $(NF-1), $NF }') \
+    if ! known_pairs=$(ssh-keygen -F "$known_target" 2>/dev/null | awk '!/^#/ && NF>=3 { print $(NF-1), $NF }') \
             || [[ -z "$known_pairs" ]]; then
         # UNKNOWN host: normal for a genuine first-time setup, but also exactly what
         # a fall-through to a brand-new wrong host looks like — surface and confirm.
@@ -818,13 +1350,13 @@ verify_host_identity() {
         echo "  Now presented:"
         printf '%s\n' "$scan" | ssh-keygen -lf - 2>/dev/null | sed 's/^/    /'
         echo "  Previously trusted:"
-        ssh-keygen -lF "$host" 2>/dev/null | grep -v '^#' | sed 's/^/    /'
+        ssh-keygen -lF "$known_target" 2>/dev/null | grep -v '^#' | sed 's/^/    /'
         echo
         print_warning "This usually means one of:"
         echo "    - the name resolved to a DIFFERENT host (e.g. DNS wildcard fall-through)"
         echo "    - the server was legitimately reinstalled (new host key)"
         echo "  Check where it points first:  getent hosts $host"
-        echo "  If the change is expected, clear the old key and retry:  ssh-keygen -R '$host'"
+        echo "  If the change is expected, clear the old key and retry:  ssh-keygen -R '$known_target'"
         return 1
     fi
 
@@ -836,6 +1368,7 @@ verify_host_identity() {
 REMOTE_USER=""
 REMOTE_USER_SET=false
 PORT=22
+PORT_SET=false
 KEY_TYPE="ed25519"
 KEY_BITS=4096
 HOST=""
@@ -849,6 +1382,9 @@ LOCAL_USER=""
 REMOVE_KEY=false
 REMOVE_PUBKEY=""
 REMOVE_KEY_LITERAL=""
+BOOTSTRAP=""
+HOSTS_FILE=""
+DOMAIN=""
 
 # Keep the original arguments so we can re-exec as the target user unchanged
 # (minus --local-user) when installing on someone else's behalf.
@@ -868,6 +1404,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         -p|--port)
             PORT="$2"
+            PORT_SET=true
             shift 2
             ;;
         -n|--name)
@@ -920,6 +1457,30 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             REMOVE_KEY_LITERAL="$2"
+            shift 2
+            ;;
+        --bootstrap)
+            if [[ $# -lt 2 ]]; then
+                print_error "--bootstrap requires the machine to set up (e.g. --bootstrap newbox)."
+                exit 1
+            fi
+            BOOTSTRAP="$2"
+            shift 2
+            ;;
+        --hosts-file)
+            if [[ $# -lt 2 ]]; then
+                print_error "--hosts-file requires a path to a file listing servers."
+                exit 1
+            fi
+            HOSTS_FILE="$2"
+            shift 2
+            ;;
+        --domain)
+            if [[ $# -lt 2 ]]; then
+                print_error "--domain requires a domain suffix (e.g. --domain example.com)."
+                exit 1
+            fi
+            DOMAIN="${2#.}"
             shift 2
             ;;
         --max-age)
@@ -994,6 +1555,17 @@ if [[ "$REMOTE_USER_SET" == true && -z "$REMOTE_USER" ]]; then
     exit 1
 fi
 REMOTE_USER="${REMOTE_USER:-$CURRENT_USER}"
+
+# Bootstrap mode: set up a DIFFERENT machine's access to one or more servers,
+# using this machine's existing access, then exit.
+if [[ -n "$BOOTSTRAP" ]]; then
+    if [[ "$ROTATE" == true || "$CHECK_AGE" == true || "$REMOVE_KEY" == true ]]; then
+        print_error "--bootstrap cannot be combined with --rotate, --check-age or --remove-key."
+        exit 1
+    fi
+    do_bootstrap
+    exit $?
+fi
 
 # Age-check mode: report key ages and offer rotations, then exit.
 if [[ "$CHECK_AGE" == true ]]; then
@@ -1194,19 +1766,28 @@ if [[ -f "$SSH_CONFIG" ]]; then
         if [[ $REPLY =~ ^[Yy]$ ]]; then
             backup_config
             # Remove the existing block, including the comment/blank lines that head it,
-            # then re-insert the new entry above the "Host *" catch-all. Buffered
-            # comment/blank lines are dropped when they belong to the removed block
-            # and flushed (kept) otherwise.
+            # then re-insert the new entry above the "Host *" catch-all. Only a
+            # Host/Match line ends a block (blank lines inside one don't), and
+            # buffered comment/blank lines are dropped when they turn out to be
+            # interior to the removed block and flushed (kept) otherwise.
             REMOVED=$(mktemp)
             awk -v host="$ALIAS" "$AWK_HOST_FUNCS"'
                 function flush() { printf "%s", buf; buf = "" }
-                /^[[:space:]]*#/ { if (skip) next; buf = buf $0 "\n"; next }
-                /^[[:space:]]*$/ { if (skip) { skip = 0; buf = ""; next } buf = buf $0 "\n"; next }
                 /^[[:space:]]*[Hh]ost[[:space:]]/ {
-                    if (host_line_matches(host)) { skip = 1; buf = ""; next }
+                    skip = 0
+                    if (host_line_matches(host)) {
+                        # Keep a grouped "Host a b" block for its other aliases;
+                        # drop only the one being replaced.
+                        rest = ""
+                        for (i = 2; i <= NF; i++) if ($i != host) rest = rest " " $i
+                        if (rest != "") { flush(); print $1 rest; next }
+                        skip = 1; buf = ""; next
+                    }
                     flush(); print; next
                 }
-                { if (skip) next; flush(); print }
+                /^[[:space:]]*[Mm]atch[[:space:]]/ { skip = 0; flush(); print; next }
+                /^[[:space:]]*#/ || /^[[:space:]]*$/ { buf = buf $0 "\n"; next }
+                { if (skip) { buf = ""; next } flush(); print }
                 END { if (!skip) flush() }
             ' "$SSH_CONFIG" > "$REMOVED"
             insert_config_entry "$REMOVED" "$TEMP_CONFIG"

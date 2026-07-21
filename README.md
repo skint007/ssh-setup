@@ -24,11 +24,17 @@ It can also **remove** a public key from a server's `authorized_keys` — the
 inverse of `ssh-copy-id`, with a guard against locking yourself out. See
 [Removing a key](#removing-a-key).
 
+And it can **bootstrap** a brand new machine: run it from a machine that already
+has access and it sets up a *different* machine's key access to your servers,
+without ever copying a private key. See [Bootstrapping another machine](#bootstrapping-another-machine).
+
 ## Requirements
 
 - Bash 4+
 - `ssh` and `ssh-keygen` (OpenSSH)
 - `ssh-copy-id` (optional — the script falls back to a manual copy if it's missing)
+- For `--bootstrap`, the machine being set up needs a POSIX shell, `ssh`,
+  `ssh-keygen`, `awk` and `mktemp` (the script itself isn't needed there)
 
 ## Installation
 
@@ -62,6 +68,9 @@ Only `--host` is required; everything else has a sensible default.
 | `--rotate` | Rotate the key of an existing entry instead of creating one (see [Rotating a key](#rotating-a-key)) | — |
 | `--check-age` | List managed keys by age and offer to rotate old ones (see [Checking key ages](#checking-key-ages)) | — |
 | `--max-age` | Days before a key counts as due for rotation (with `--check-age`) | `90` |
+| `--bootstrap` | Machine to set up access **for**, using this machine's access (see [Bootstrapping another machine](#bootstrapping-another-machine)) | — |
+| `--hosts-file` | File of servers to bootstrap, one `[user@]host[:port]` per line | — |
+| `--domain` | Domain suffix appended to any bare (dotless) server name | — |
 | `--help` | Show usage and exit | — |
 
 > **Note:** `-h` means `--host`, not help. Use `--help` for the usage message.
@@ -86,6 +95,12 @@ Only `--host` is required; everything else has a sensible default.
 
 # List all managed keys by age; offer to rotate any older than 180 days
 ./ssh-setup.sh --check-age --max-age 180
+
+# Give a brand new machine access to a server, from a machine that has access
+./ssh-setup.sh --bootstrap newbox --host server1
+
+# ...or to a whole fleet at once
+./ssh-setup.sh --bootstrap newbox --hosts-file servers.txt --domain tail1234.ts.net
 
 # As root, set up SSH access for skint007 instead of root
 sudo ./ssh-setup.sh --host example.com --local-user skint007
@@ -251,6 +266,98 @@ ssh-setup --remove-key --host homeserver --key 'ssh-ed25519 AAAA...'
 > up and verified working — otherwise you may drop your last way in. There's no
 > standard `ssh-remove-id`; this fills that gap.
 
+## Bootstrapping another machine
+
+`ssh-copy-id` needs an existing way in to the server. On a fleet with
+`PasswordAuthentication no`, a brand new machine has no way in at all, so setting
+up its access is a chicken-and-egg problem. The usual workaround — putting one
+shared key on every server — is exactly what you don't want.
+
+`--bootstrap` solves it from the other side. Run it on a machine that **already**
+has working access, and it sets up a **different** machine's access:
+
+```bash
+# One server
+ssh-setup --bootstrap newbox --host server1 --alias server1
+
+# A whole fleet, one "[user@]host[:port]" per line in servers.txt
+ssh-setup --bootstrap newbox --hosts-file servers.txt --domain tail1234.ts.net
+```
+
+For each server it:
+
+1. **Generates the keypair on `newbox`** over SSH. The private key never leaves
+   that machine — only the `.pub` travels.
+2. **Installs the public key** in the server's `authorized_keys`, authenticating
+   with *this* machine's existing working key.
+3. **Writes the `Host` entry** in `newbox`'s `~/.ssh/config` (`IdentityFile` +
+   `IdentitiesOnly yes`).
+4. **Verifies** by having `newbox` itself connect to the server with the new key.
+
+```
+[INFO] Bootstrapping newbox -> root@server1:22 (alias 'server1')
+[INFO] Host key for 'server1' verified against known_hosts.
+[SUCCESS]   Key generated on newbox: ~/.ssh/id_ed25519_server1
+[SUCCESS]   Public key added to root@server1:22
+[SUCCESS]   SSH config entry 'server1' written on newbox
+[SUCCESS]   Verified: newbox can now 'ssh server1'
+```
+
+Details worth knowing:
+
+- **No private key is ever copied**, so a bootstrap can't leak one machine's
+  identity onto another.
+- **Server details come from your own config**, resolved with `ssh -G` — the same
+  answer ssh itself would use, so wildcard blocks (`Host *.example.com`) and
+  `Match` rules count, not just exact aliases. The resolved
+  `HostName`/`User`/`Port` are what gets written on the new machine, and ssh
+  connects by name so that entry's identity, `ProxyJump`, etc. still apply.
+  Explicit values win: a spec's `user@`/`:port` first, then `--user`/`--port`,
+  then the config.
+- **The alias** is `--alias` for a single server, or the short name (first label)
+  of each server in a batch. `--domain` appends a suffix to bare names, so a
+  hosts file can list `server1`, `server2`, … instead of full FQDNs. If two
+  servers in a batch would shorten to the same alias (`web.prod.x` and
+  `web.staging.x`), the run stops before touching anything.
+- **Idempotent.** An existing key on the new machine is reused, the
+  `authorized_keys` append matches on the key's base64 material (not the whole
+  line, so a different comment isn't a duplicate), and the config entry is
+  replaced rather than appended again. Re-running a batch after fixing one
+  offline host is safe.
+- **Fails per host, not per run.** One unreachable server doesn't stop the batch;
+  a summary at the end lists what worked and what didn't, and the exit status is
+  non-zero if anything failed.
+- **A symlinked `~/.ssh/config` stays a symlink.** These are often links into a
+  dotfiles repo, so the new content is written *through* the link instead of
+  replacing it with a regular file (which would orphan the dotfiles copy). The
+  config is backed up once per run before the first write.
+- **Entries go above any `Host *` block**, same first-match-wins reasoning as the
+  local path.
+- **The verification runs `ssh <alias>` on the new machine** — the exact command
+  you'll use — and checks which account it lands on. A direct `-i key user@host`
+  probe would bypass the entry that was just written, so an earlier `Host`/`Match`
+  rule shadowing it (SSH is first-match-wins) would go unnoticed. It also passes
+  `-o ControlPath=none`, because with `ControlMaster auto` an already-open
+  multiplexed session makes a broken key look like it works.
+- **A server reached through a `ProxyCommand` is refused up front** rather than
+  left with a key it can't use — that command line belongs to *this* machine. A
+  `ProxyJump` is carried into the written entry, with a warning that the new
+  machine needs its own access to the jump host.
+- **The new machine is reached over a control socket this run creates**, so you
+  authenticate to it at most once even for a fleet of servers — password auth to
+  the new machine is fine.
+- **Both ends get the host-identity check.** The machine being bootstrapped is
+  checked *before* any remote command runs on it — otherwise a name that resolved
+  to the wrong box could hand back a public key that then gets installed across
+  the whole fleet — and each server is checked before anything is written to it
+  (see [Behavior & safety](#behavior--safety)).
+- **The machine is checked for `ssh`, `ssh-keygen`, `awk` and `mktemp` up front**,
+  so a missing package can't leave keys installed on servers it can't use.
+
+Once a machine is bootstrapped, any shared key you used to get this far is
+redundant — remove it with
+[`--remove-key`](#removing-a-key).
+
 ## What it creates
 
 For a host named `example.com` with the default `ed25519` type:
@@ -318,7 +425,10 @@ it won't change values you've set.
   `known_hosts`: a **changed** key aborts (with a hint that the name may have
   resolved to a different host — e.g. DNS wildcard fall-through — or the server
   was reinstalled), an **unknown** key shows the fingerprint + resolved IP and
-  asks you to confirm, and a match proceeds quietly. This overrides an inherited
+  asks you to confirm, and a match proceeds quietly. Hosts on a non-default port
+  are looked up as `[host]:port`, the way OpenSSH files them, so a changed key
+  there is refused rather than mistaken for a first-time connection. This
+  overrides an inherited
   `StrictHostKeyChecking no` for the check, so a name that silently resolves to
   the wrong box can't be handed your key. If the host is unreachable for the
   probe, the check is skipped rather than blocking setup.
@@ -332,7 +442,12 @@ it won't change values you've set.
   single backup of the pre-run state.
 - **Re-running for an existing alias** prompts before replacing it. The old
   block is removed cleanly (including its leading comment) before the new one is
-  re-inserted, so the config doesn't accumulate stale or duplicate entries.
+  re-inserted, so the config doesn't accumulate stale or duplicate entries. A
+  block runs until the next `Host`/`Match` line, so blank lines and comments
+  inside a hand-formatted entry are removed with it rather than left behind —
+  while a comment run directly above the *next* block is kept. A grouped
+  `Host prod prod-admin` line keeps its other aliases; only the one being
+  replaced is dropped.
 - **Alias matching is exact**, so glob-style aliases (e.g. `*.example.com`) and
   multi-alias `Host` lines are handled correctly.
 - **New entries are placed above a `Host *` catch-all** (rather than at the end
