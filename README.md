@@ -33,8 +33,8 @@ without ever copying a private key. See [Bootstrapping another machine](#bootstr
 - Bash 4+
 - `ssh` and `ssh-keygen` (OpenSSH)
 - `ssh-copy-id` (optional — the script falls back to a manual copy if it's missing)
-- For `--bootstrap`, the machine being set up needs a POSIX shell, `ssh-keygen`
-  and `awk` (the script itself isn't needed there)
+- For `--bootstrap`, the machine being set up needs a POSIX shell, `ssh`,
+  `ssh-keygen`, `awk` and `mktemp` (the script itself isn't needed there)
 
 ## Installation
 
@@ -333,11 +333,16 @@ Details worth knowing:
   config is backed up once per run before the first write.
 - **Entries go above any `Host *` block**, same first-match-wins reasoning as the
   local path.
-- **The verification is a real connection**, made with `-o ControlPath=none -o
-  IdentitiesOnly=yes`: with `ControlMaster auto`, an already-open multiplexed
-  session makes a broken key look like it works, and without `IdentitiesOnly`
-  some *other* key the machine has may be what actually authenticated. Both give
-  false green results.
+- **The verification runs `ssh <alias>` on the new machine** — the exact command
+  you'll use — and checks which account it lands on. A direct `-i key user@host`
+  probe would bypass the entry that was just written, so an earlier `Host`/`Match`
+  rule shadowing it (SSH is first-match-wins) would go unnoticed. It also passes
+  `-o ControlPath=none`, because with `ControlMaster auto` an already-open
+  multiplexed session makes a broken key look like it works.
+- **A server reached through a `ProxyCommand` is refused up front** rather than
+  left with a key it can't use — that command line belongs to *this* machine. A
+  `ProxyJump` is carried into the written entry, with a warning that the new
+  machine needs its own access to the jump host.
 - **The new machine is reached over a control socket this run creates**, so you
   authenticate to it at most once even for a fleet of servers — password auth to
   the new machine is fine.
@@ -346,8 +351,8 @@ Details worth knowing:
   to the wrong box could hand back a public key that then gets installed across
   the whole fleet — and each server is checked before anything is written to it
   (see [Behavior & safety](#behavior--safety)).
-- **The machine is checked for `ssh`, `ssh-keygen` and `awk` up front**, so a
-  missing client package can't leave keys installed on servers it can't use.
+- **The machine is checked for `ssh`, `ssh-keygen`, `awk` and `mktemp` up front**,
+  so a missing package can't leave keys installed on servers it can't use.
 
 Once a machine is bootstrapped, any shared key you used to get this far is
 redundant — remove it with
@@ -420,7 +425,10 @@ it won't change values you've set.
   `known_hosts`: a **changed** key aborts (with a hint that the name may have
   resolved to a different host — e.g. DNS wildcard fall-through — or the server
   was reinstalled), an **unknown** key shows the fingerprint + resolved IP and
-  asks you to confirm, and a match proceeds quietly. This overrides an inherited
+  asks you to confirm, and a match proceeds quietly. Hosts on a non-default port
+  are looked up as `[host]:port`, the way OpenSSH files them, so a changed key
+  there is refused rather than mistaken for a first-time connection. This
+  overrides an inherited
   `StrictHostKeyChecking no` for the check, so a name that silently resolves to
   the wrong box can't be handed your key. If the host is unreachable for the
   probe, the check is skipped rather than blocking setup.
@@ -437,7 +445,9 @@ it won't change values you've set.
   re-inserted, so the config doesn't accumulate stale or duplicate entries. A
   block runs until the next `Host`/`Match` line, so blank lines and comments
   inside a hand-formatted entry are removed with it rather than left behind —
-  while a comment run directly above the *next* block is kept.
+  while a comment run directly above the *next* block is kept. A grouped
+  `Host prod prod-admin` line keeps its other aliases; only the one being
+  replaced is dropped.
 - **Alias matching is exact**, so glob-style aliases (e.g. `*.example.com`) and
   multi-alias `Host` lines are handled correctly.
 - **New entries are placed above a `Host *` catch-all** (rather than at the end

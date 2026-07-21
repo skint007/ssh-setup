@@ -820,13 +820,19 @@ parse_target_spec() {
 CFG_USER=""
 CFG_HOSTNAME=""
 CFG_PORT=""
+CFG_PROXYJUMP=""
+CFG_PROXYCOMMAND=""
 resolve_ssh_config() {
     local g
-    CFG_USER=""; CFG_HOSTNAME=""; CFG_PORT=""
+    CFG_USER=""; CFG_HOSTNAME=""; CFG_PORT=""; CFG_PROXYJUMP=""; CFG_PROXYCOMMAND=""
     g=$(ssh -G "$1" 2>/dev/null) || return 1
     CFG_USER=$(awk 'tolower($1) == "user" { print $2; exit }' <<< "$g")
     CFG_HOSTNAME=$(awk 'tolower($1) == "hostname" { print $2; exit }' <<< "$g")
     CFG_PORT=$(awk 'tolower($1) == "port" { print $2; exit }' <<< "$g")
+    # Only printed when actually set, so a value here means the connection goes
+    # through a proxy — which the machine we're bootstrapping has to reproduce.
+    CFG_PROXYJUMP=$(awk 'tolower($1) == "proxyjump" { $1 = ""; sub(/^[[:space:]]+/, ""); print; exit }' <<< "$g")
+    CFG_PROXYCOMMAND=$(awk 'tolower($1) == "proxycommand" { $1 = ""; sub(/^[[:space:]]+/, ""); print; exit }' <<< "$g")
     [[ -n "$CFG_HOSTNAME" ]]
 }
 
@@ -916,7 +922,15 @@ awk -v host="$alias_name" '
     # runs to the next one, blank lines and comments included.
     /^[[:space:]]*[Hh]ost[[:space:]]/ {
         skip = 0
-        if (host_line_matches(host)) { skip = 1; buf = ""; next }
+        if (host_line_matches(host)) {
+            # A grouped "Host a b" line still serves its other aliases, so drop
+            # only ours from it and keep the block; removing the whole thing
+            # would silently take those siblings with it.
+            rest = ""
+            for (i = 2; i <= NF; i++) if ($i != host) rest = rest " " $i
+            if (rest != "") { flush(); print $1 rest; next }
+            skip = 1; buf = ""; next
+        }
         flush(); print; next
     }
     /^[[:space:]]*[Mm]atch[[:space:]]/ { skip = 0; flush(); print; next }
@@ -1024,6 +1038,14 @@ bootstrap_one() {
     # the config names while the entry we write points somewhere else.
     local ssh_target=(-l "$user" -p "$port" "$name")
 
+    # A ProxyCommand is a command line for THIS machine — the other one may not
+    # have the binary, the socket or the credentials it needs, and we'd only find
+    # out after the key was already installed. Refuse before touching the server.
+    if [[ -n "$CFG_PROXYCOMMAND" ]]; then
+        BOOTSTRAP_FAIL_REASON="reached through a ProxyCommand, which can't be reproduced on $BOOTSTRAP — set that host up by hand"
+        return 1
+    fi
+
     # One alias per server on the new machine: --alias when a single --host was
     # given, otherwise the short name (first label) of the server.
     alias="$ALIAS"
@@ -1091,7 +1113,16 @@ $REMOTE_GEN_SH" </dev/null); then
 Host $alias
     HostName $hostname
     User $user
-    Port $port
+    Port $port"
+    # This machine only reaches the server through a jump host, so the entry is
+    # useless without it. Carry it over — but the new machine needs its own
+    # access to that jump host, which is a separate bootstrap.
+    if [[ -n "$CFG_PROXYJUMP" ]]; then
+        entry="$entry
+    ProxyJump $CFG_PROXYJUMP"
+        print_warning "  This server is reached via ProxyJump $CFG_PROXYJUMP — $BOOTSTRAP needs its own access to that jump host."
+    fi
+    entry="$entry
     IdentityFile ~/.ssh/$key_base
     IdentitiesOnly yes
 "
@@ -1105,14 +1136,23 @@ $REMOTE_CONFIG_SH" <<< "$entry") || [[ "$out" != WROTE ]]; then
     BOOTSTRAP_CONFIG_BACKED_UP=true
     print_success "  SSH config entry '$alias' written on $BOOTSTRAP"
 
-    # 4. Verify by having the NEW machine actually connect to the server with
-    #    the new key. ControlPath=none + IdentitiesOnly=yes are essential: an
-    #    open multiplexed session (or another key that happens to work) would
-    #    make a broken key look fine and give a false green.
-    if ! machine_ssh "ssh -o ControlPath=none -o IdentitiesOnly=yes -o BatchMode=yes \
+    # 4. Verify the way the user will actually connect: "ssh <alias>" ON the new
+    #    machine. A bare "-i key user@host" probe would bypass the entry we just
+    #    wrote — an earlier Host/Match rule there can shadow it (first-match-wins)
+    #    and send the alias to another account or host, which the probe would
+    #    never notice. ControlPath=none stops an already-open multiplexed session
+    #    from making a broken key look fine, and the entry's own IdentitiesOnly
+    #    keeps some other key from being what actually authenticates.
+    out=$(machine_ssh "ssh -o ControlPath=none -o BatchMode=yes \
             -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 \
-            -i ~/.ssh/$key_base -p $port $user@$hostname true" </dev/null >/dev/null 2>&1; then
-        BOOTSTRAP_FAIL_REASON="$BOOTSTRAP could not authenticate to $user@$hostname:$port with the new key"
+            $alias 'id -un'" </dev/null 2>/dev/null) || out=""
+    out="${out//[$'\r\n']/}"
+    if [[ -z "$out" ]]; then
+        BOOTSTRAP_FAIL_REASON="'ssh $alias' on $BOOTSTRAP could not connect to $user@$hostname:$port with the new key"
+        return 1
+    fi
+    if [[ "$out" != "$user" ]]; then
+        BOOTSTRAP_FAIL_REASON="'ssh $alias' on $BOOTSTRAP lands on account '$out', not '$user' — an earlier Host/Match rule there is shadowing the new entry"
         return 1
     fi
     print_success "  Verified: $BOOTSTRAP can now 'ssh $alias'"
@@ -1209,8 +1249,9 @@ do_bootstrap() {
     # later steps need — including the ssh CLIENT, which the final verification
     # runs. Checking it here means a machine with sshd but no client can't get
     # halfway through and leave a key installed on servers it can't use.
-    if ! machine_ssh 'command -v ssh >/dev/null && command -v ssh-keygen >/dev/null && command -v awk >/dev/null' </dev/null; then
-        print_error "Cannot reach '$BOOTSTRAP', or it lacks ssh/ssh-keygen/awk."
+    if ! machine_ssh 'command -v ssh >/dev/null && command -v ssh-keygen >/dev/null &&
+            command -v awk >/dev/null && command -v mktemp >/dev/null' </dev/null; then
+        print_error "Cannot reach '$BOOTSTRAP', or it lacks ssh/ssh-keygen/awk/mktemp."
         print_info "The machine being bootstrapped must be reachable from here (password auth is fine)."
         return 1
     fi
@@ -1259,6 +1300,12 @@ do_bootstrap() {
 # IP and asks, and a host key that matches known_hosts proceeds quietly.
 verify_host_identity() {
     local host="$1" port="$2" scan ips known_pairs scan_pairs changed=0 ktype kblob sblob reply
+    local known_target="$host"
+
+    # OpenSSH files a host reached on a non-default port under "[host]:port", so
+    # a bare-name lookup for one of those finds nothing and a CHANGED key would
+    # read as a merely unknown host — which is a prompt, not a refusal.
+    [[ "$port" != 22 ]] && known_target="[$host]:$port"
 
     ips=$(getent hosts "$host" 2>/dev/null | awk '{print $1}' | sort -u | paste -sd', ' -)
 
@@ -1270,7 +1317,7 @@ verify_host_identity() {
     fi
     scan_pairs=$(awk '!/^#/ && NF>=3 { print $(NF-1), $NF }' <<< "$scan")
 
-    if ! known_pairs=$(ssh-keygen -F "$host" 2>/dev/null | awk '!/^#/ && NF>=3 { print $(NF-1), $NF }') \
+    if ! known_pairs=$(ssh-keygen -F "$known_target" 2>/dev/null | awk '!/^#/ && NF>=3 { print $(NF-1), $NF }') \
             || [[ -z "$known_pairs" ]]; then
         # UNKNOWN host: normal for a genuine first-time setup, but also exactly what
         # a fall-through to a brand-new wrong host looks like — surface and confirm.
@@ -1303,13 +1350,13 @@ verify_host_identity() {
         echo "  Now presented:"
         printf '%s\n' "$scan" | ssh-keygen -lf - 2>/dev/null | sed 's/^/    /'
         echo "  Previously trusted:"
-        ssh-keygen -lF "$host" 2>/dev/null | grep -v '^#' | sed 's/^/    /'
+        ssh-keygen -lF "$known_target" 2>/dev/null | grep -v '^#' | sed 's/^/    /'
         echo
         print_warning "This usually means one of:"
         echo "    - the name resolved to a DIFFERENT host (e.g. DNS wildcard fall-through)"
         echo "    - the server was legitimately reinstalled (new host key)"
         echo "  Check where it points first:  getent hosts $host"
-        echo "  If the change is expected, clear the old key and retry:  ssh-keygen -R '$host'"
+        echo "  If the change is expected, clear the old key and retry:  ssh-keygen -R '$known_target'"
         return 1
     fi
 
@@ -1728,7 +1775,14 @@ if [[ -f "$SSH_CONFIG" ]]; then
                 function flush() { printf "%s", buf; buf = "" }
                 /^[[:space:]]*[Hh]ost[[:space:]]/ {
                     skip = 0
-                    if (host_line_matches(host)) { skip = 1; buf = ""; next }
+                    if (host_line_matches(host)) {
+                        # Keep a grouped "Host a b" block for its other aliases;
+                        # drop only the one being replaced.
+                        rest = ""
+                        for (i = 2; i <= NF; i++) if ($i != host) rest = rest " " $i
+                        if (rest != "") { flush(); print $1 rest; next }
+                        skip = 1; buf = ""; next
+                    }
                     flush(); print; next
                 }
                 /^[[:space:]]*[Mm]atch[[:space:]]/ { skip = 0; flush(); print; next }
