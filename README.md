@@ -24,11 +24,17 @@ It can also **remove** a public key from a server's `authorized_keys` — the
 inverse of `ssh-copy-id`, with a guard against locking yourself out. See
 [Removing a key](#removing-a-key).
 
+And it can **bootstrap** a brand new machine: run it from a machine that already
+has access and it sets up a *different* machine's key access to your servers,
+without ever copying a private key. See [Bootstrapping another machine](#bootstrapping-another-machine).
+
 ## Requirements
 
 - Bash 4+
 - `ssh` and `ssh-keygen` (OpenSSH)
 - `ssh-copy-id` (optional — the script falls back to a manual copy if it's missing)
+- For `--bootstrap`, the machine being set up needs a POSIX shell, `ssh-keygen`
+  and `awk` (the script itself isn't needed there)
 
 ## Installation
 
@@ -62,6 +68,9 @@ Only `--host` is required; everything else has a sensible default.
 | `--rotate` | Rotate the key of an existing entry instead of creating one (see [Rotating a key](#rotating-a-key)) | — |
 | `--check-age` | List managed keys by age and offer to rotate old ones (see [Checking key ages](#checking-key-ages)) | — |
 | `--max-age` | Days before a key counts as due for rotation (with `--check-age`) | `90` |
+| `--bootstrap` | Machine to set up access **for**, using this machine's access (see [Bootstrapping another machine](#bootstrapping-another-machine)) | — |
+| `--hosts-file` | File of servers to bootstrap, one `[user@]host[:port]` per line | — |
+| `--domain` | Domain suffix appended to any bare (dotless) server name | — |
 | `--help` | Show usage and exit | — |
 
 > **Note:** `-h` means `--host`, not help. Use `--help` for the usage message.
@@ -86,6 +95,12 @@ Only `--host` is required; everything else has a sensible default.
 
 # List all managed keys by age; offer to rotate any older than 180 days
 ./ssh-setup.sh --check-age --max-age 180
+
+# Give a brand new machine access to a server, from a machine that has access
+./ssh-setup.sh --bootstrap newbox --host server1
+
+# ...or to a whole fleet at once
+./ssh-setup.sh --bootstrap newbox --hosts-file servers.txt --domain tail1234.ts.net
 
 # As root, set up SSH access for skint007 instead of root
 sudo ./ssh-setup.sh --host example.com --local-user skint007
@@ -250,6 +265,83 @@ ssh-setup --remove-key --host homeserver --key 'ssh-ed25519 AAAA...'
 > ⚠️ Remove a shared/default key only **after** the host's dedicated key is set
 > up and verified working — otherwise you may drop your last way in. There's no
 > standard `ssh-remove-id`; this fills that gap.
+
+## Bootstrapping another machine
+
+`ssh-copy-id` needs an existing way in to the server. On a fleet with
+`PasswordAuthentication no`, a brand new machine has no way in at all, so setting
+up its access is a chicken-and-egg problem. The usual workaround — putting one
+shared key on every server — is exactly what you don't want.
+
+`--bootstrap` solves it from the other side. Run it on a machine that **already**
+has working access, and it sets up a **different** machine's access:
+
+```bash
+# One server
+ssh-setup --bootstrap newbox --host server1 --alias server1
+
+# A whole fleet, one "[user@]host[:port]" per line in servers.txt
+ssh-setup --bootstrap newbox --hosts-file servers.txt --domain tail1234.ts.net
+```
+
+For each server it:
+
+1. **Generates the keypair on `newbox`** over SSH. The private key never leaves
+   that machine — only the `.pub` travels.
+2. **Installs the public key** in the server's `authorized_keys`, authenticating
+   with *this* machine's existing working key.
+3. **Writes the `Host` entry** in `newbox`'s `~/.ssh/config` (`IdentityFile` +
+   `IdentitiesOnly yes`).
+4. **Verifies** by having `newbox` itself connect to the server with the new key.
+
+```
+[INFO] Bootstrapping newbox -> root@server1:22 (alias 'server1')
+[INFO] Host key for 'server1' verified against known_hosts.
+[SUCCESS]   Key generated on newbox: ~/.ssh/id_ed25519_server1
+[SUCCESS]   Public key added to root@server1:22
+[SUCCESS]   SSH config entry 'server1' written on newbox
+[SUCCESS]   Verified: newbox can now 'ssh server1'
+```
+
+Details worth knowing:
+
+- **No private key is ever copied**, so a bootstrap can't leak one machine's
+  identity onto another.
+- **Server details come from your own config.** If the server has a `Host` entry
+  here, its `HostName`/`User`/`Port` are reused for the entry written on the new
+  machine, and ssh authenticates with that entry's key. Otherwise `--user`,
+  `--port` and the name you passed are used.
+- **The alias** is `--alias` for a single server, or the short name (first label)
+  of each server in a batch. `--domain` appends a suffix to bare names, so a
+  hosts file can list `server1`, `server2`, … instead of full FQDNs.
+- **Idempotent.** An existing key on the new machine is reused, the
+  `authorized_keys` append matches on the key's base64 material (not the whole
+  line, so a different comment isn't a duplicate), and the config entry is
+  replaced rather than appended again. Re-running a batch after fixing one
+  offline host is safe.
+- **Fails per host, not per run.** One unreachable server doesn't stop the batch;
+  a summary at the end lists what worked and what didn't, and the exit status is
+  non-zero if anything failed.
+- **A symlinked `~/.ssh/config` stays a symlink.** These are often links into a
+  dotfiles repo, so the new content is written *through* the link instead of
+  replacing it with a regular file (which would orphan the dotfiles copy). The
+  config is backed up once per run before the first write.
+- **Entries go above any `Host *` block**, same first-match-wins reasoning as the
+  local path.
+- **The verification is a real connection**, made with `-o ControlPath=none -o
+  IdentitiesOnly=yes`: with `ControlMaster auto`, an already-open multiplexed
+  session makes a broken key look like it works, and without `IdentitiesOnly`
+  some *other* key the machine has may be what actually authenticated. Both give
+  false green results.
+- **The new machine is reached over a control socket this run creates**, so you
+  authenticate to it at most once even for a fleet of servers — password auth to
+  the new machine is fine.
+- Servers still get the host-identity check before anything is written (see
+  [Behavior & safety](#behavior--safety)).
+
+Once a machine is bootstrapped, any shared key you used to get this far is
+redundant — remove it with
+[`--remove-key`](#removing-a-key).
 
 ## What it creates
 
