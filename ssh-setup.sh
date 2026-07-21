@@ -796,6 +796,40 @@ valid_name() {
     [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]
 }
 
+# Split a target spec "[user@]host[:port]" into SPEC_USER/SPEC_NAME/SPEC_PORT,
+# appending --domain to a bare (dotless) name. Used both per host and up front,
+# so the alias a batch will derive is known before anything is touched.
+SPEC_USER=""
+SPEC_NAME=""
+SPEC_PORT=""
+parse_target_spec() {
+    local s="$1"
+    SPEC_USER=""
+    SPEC_PORT=""
+    if [[ "$s" == *@* ]]; then SPEC_USER="${s%%@*}"; s="${s#*@}"; fi
+    if [[ "$s" == *:* ]]; then SPEC_PORT="${s##*:}"; s="${s%:*}"; fi
+    if [[ -n "$DOMAIN" && "$s" != *.* ]]; then s="$s.$DOMAIN"; fi
+    SPEC_NAME="$s"
+}
+
+# Ask ssh itself what it would use for a name, into CFG_USER/CFG_HOSTNAME/
+# CFG_PORT. "ssh -G" applies the whole config the way a real connection would —
+# including wildcard patterns ("Host *.example.com") and Match blocks, which an
+# exact-alias lookup misses, and which is exactly how fleets tend to be
+# configured. For a name with no config at all it just echoes back the defaults.
+CFG_USER=""
+CFG_HOSTNAME=""
+CFG_PORT=""
+resolve_ssh_config() {
+    local g
+    CFG_USER=""; CFG_HOSTNAME=""; CFG_PORT=""
+    g=$(ssh -G "$1" 2>/dev/null) || return 1
+    CFG_USER=$(awk 'tolower($1) == "user" { print $2; exit }' <<< "$g")
+    CFG_HOSTNAME=$(awk 'tolower($1) == "hostname" { print $2; exit }' <<< "$g")
+    CFG_PORT=$(awk 'tolower($1) == "port" { print $2; exit }' <<< "$g")
+    [[ -n "$CFG_HOSTNAME" ]]
+}
+
 # Generate the key on the new machine if it isn't already there (re-running the
 # batch reuses it), then print "GENERATED"/"REUSED" and the public key.
 # Expects: keyfile, keytype, keybits, target_host, today.
@@ -878,13 +912,20 @@ awk -v host="$alias_name" '
         return 0
     }
     function flush() { printf "%s", buf; buf = "" }
-    /^[[:space:]]*#/ { if (skip) next; buf = buf $0 "\n"; next }
-    /^[[:space:]]*$/ { if (skip) { skip = 0; buf = ""; next } buf = buf $0 "\n"; next }
+    # A Host/Match line is the only thing that ends a block: an ssh_config block
+    # runs to the next one, blank lines and comments included.
     /^[[:space:]]*[Hh]ost[[:space:]]/ {
+        skip = 0
         if (host_line_matches(host)) { skip = 1; buf = ""; next }
         flush(); print; next
     }
-    { if (skip) next; flush(); print }
+    /^[[:space:]]*[Mm]atch[[:space:]]/ { skip = 0; flush(); print; next }
+    # Comments and blank lines are buffered rather than emitted: a run of them
+    # directly above a block heads THAT block, so it has to survive even when it
+    # sits inside the one being removed. A directive line proves the run was
+    # interior to the removed block, so it is dropped there.
+    /^[[:space:]]*#/ || /^[[:space:]]*$/ { buf = buf $0 "\n"; next }
+    { if (skip) { buf = ""; next } flush(); print }
     END { if (!skip) flush() }
 ' "$real" > "$t1"
 ENTRY="$entry" awk '
@@ -937,13 +978,10 @@ bootstrap_one() {
 
     BOOTSTRAP_FAIL_REASON=""
 
-    # [user@]host[:port], with --domain appended to any bare (dotless) name.
-    name="$spec"
-    user=""
-    port=""
-    if [[ "$name" == *@* ]]; then user="${name%%@*}"; name="${name#*@}"; fi
-    if [[ "$name" == *:* ]]; then port="${name##*:}"; name="${name%:*}"; fi
-    if [[ -n "$DOMAIN" && "$name" != *.* ]]; then name="$name.$DOMAIN"; fi
+    parse_target_spec "$spec"
+    name="$SPEC_NAME"
+    user="$SPEC_USER"
+    port="$SPEC_PORT"
 
     if ! valid_name "$name"; then
         BOOTSTRAP_FAIL_REASON="invalid host name '$name'"
@@ -958,18 +996,20 @@ bootstrap_one() {
         return 1
     fi
 
-    # Prefer this machine's own config entry for the server: it tells us the
-    # HostName/User/Port to write on the new machine, and lets ssh authenticate
-    # with the identity that already works here.
-    local ssh_target=()
-    if [[ -f "$SSH_CONFIG" ]] && host_exists "$name" "$SSH_CONFIG"; then
-        hostname=$(config_get "$name" HostName); hostname="${hostname:-$name}"
-        user="${user:-$(config_get "$name" User)}"
-        port="${port:-$(config_get "$name" Port)}"
-        ssh_target=("$name")
+    # Take the settings this machine already uses for the server — they are what
+    # the new machine needs in its own config, and they let ssh authenticate here
+    # with the identity that already works. Explicit values win over the config:
+    # a spec's user@/:port first, then --user/--port, then what ssh resolves.
+    if resolve_ssh_config "$name"; then
+        hostname="$CFG_HOSTNAME"
+        if [[ -z "$user" ]]; then
+            [[ "$REMOTE_USER_SET" == true ]] && user="$REMOTE_USER" || user="$CFG_USER"
+        fi
+        if [[ -z "$port" ]]; then
+            [[ "$PORT_SET" == true ]] && port="$PORT" || port="$CFG_PORT"
+        fi
     else
         hostname="$name"
-        ssh_target=(-p "${port:-$PORT}" "${user:-$REMOTE_USER}@$name")
     fi
     user="${user:-$REMOTE_USER}"
     port="${port:-$PORT}"
@@ -977,6 +1017,12 @@ bootstrap_one() {
         BOOTSTRAP_FAIL_REASON="invalid HostName '$hostname'"
         return 1
     fi
+
+    # Connect by NAME so any config for it (identity, ProxyJump, wildcard block)
+    # still applies, but pin the user and port to what we resolved — otherwise a
+    # spec like "otheruser@server:2222" would install the key into the account
+    # the config names while the entry we write points somewhere else.
+    local ssh_target=(-l "$user" -p "$port" "$name")
 
     # One alias per server on the new machine: --alias when a single --host was
     # given, otherwise the short name (first label) of the server.
@@ -1117,9 +1163,41 @@ do_bootstrap() {
         return 1
     fi
 
+    # Derived aliases have to be unique. "web.prod.example.com" and
+    # "web.staging.example.com" both shorten to "web", which would share one key
+    # and overwrite each other's config entry while the summary claimed both
+    # succeeded — catch it before anything is written.
+    if [[ -z "$ALIAS" && ${#targets[@]} -gt 1 ]]; then
+        local dupes
+        dupes=$(for spec in "${targets[@]}"; do
+                    parse_target_spec "$spec"; printf '%s\n' "${SPEC_NAME%%.*}"
+                done | sort | uniq -d)
+        if [[ -n "$dupes" ]]; then
+            print_error "These servers shorten to the same alias, so they'd overwrite each other:"
+            while IFS= read -r line; do echo "    $line"; done <<< "$dupes"
+            print_info "Bootstrap them one at a time with --host <server> --alias <unique-name>."
+            return 1
+        fi
+    fi
+
     print_info "Bootstrapping SSH access for '$BOOTSTRAP' to ${#targets[@]} server(s)."
     echo "  Keys are generated on '$BOOTSTRAP' — no private key is ever copied."
     echo
+
+    # Confirm the machine we're about to run commands on is the one we mean,
+    # BEFORE any remote code runs. If the name resolved to the wrong box (or a
+    # spoofed one), it would otherwise hand us a public key that we'd then go
+    # and install on every server in the batch.
+    local m_host m_port
+    if resolve_ssh_config "$BOOTSTRAP"; then
+        m_host="$CFG_HOSTNAME"; m_port="${CFG_PORT:-22}"
+    else
+        m_host="$BOOTSTRAP"; m_port=22
+    fi
+    if ! verify_host_identity "$m_host" "$m_port"; then
+        print_error "Aborting: the identity of '$BOOTSTRAP' could not be confirmed."
+        return 1
+    fi
 
     BOOTSTRAP_CTL_DIR=$(mktemp -d)
     trap bootstrap_cleanup EXIT
@@ -1127,9 +1205,12 @@ do_bootstrap() {
     trap 'bootstrap_cleanup; exit 143' TERM
 
     # One connection up front: it opens the shared control socket (so a password
-    # prompt happens at most once) and proves the machine has what we need.
-    if ! machine_ssh 'command -v ssh-keygen >/dev/null && command -v awk >/dev/null' </dev/null; then
-        print_error "Cannot reach '$BOOTSTRAP', or it lacks ssh-keygen/awk."
+    # prompt happens at most once) and proves the machine has everything the
+    # later steps need — including the ssh CLIENT, which the final verification
+    # runs. Checking it here means a machine with sshd but no client can't get
+    # halfway through and leave a key installed on servers it can't use.
+    if ! machine_ssh 'command -v ssh >/dev/null && command -v ssh-keygen >/dev/null && command -v awk >/dev/null' </dev/null; then
+        print_error "Cannot reach '$BOOTSTRAP', or it lacks ssh/ssh-keygen/awk."
         print_info "The machine being bootstrapped must be reachable from here (password auth is fine)."
         return 1
     fi
@@ -1240,6 +1321,7 @@ verify_host_identity() {
 REMOTE_USER=""
 REMOTE_USER_SET=false
 PORT=22
+PORT_SET=false
 KEY_TYPE="ed25519"
 KEY_BITS=4096
 HOST=""
@@ -1275,6 +1357,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         -p|--port)
             PORT="$2"
+            PORT_SET=true
             shift 2
             ;;
         -n|--name)
@@ -1636,19 +1719,21 @@ if [[ -f "$SSH_CONFIG" ]]; then
         if [[ $REPLY =~ ^[Yy]$ ]]; then
             backup_config
             # Remove the existing block, including the comment/blank lines that head it,
-            # then re-insert the new entry above the "Host *" catch-all. Buffered
-            # comment/blank lines are dropped when they belong to the removed block
-            # and flushed (kept) otherwise.
+            # then re-insert the new entry above the "Host *" catch-all. Only a
+            # Host/Match line ends a block (blank lines inside one don't), and
+            # buffered comment/blank lines are dropped when they turn out to be
+            # interior to the removed block and flushed (kept) otherwise.
             REMOVED=$(mktemp)
             awk -v host="$ALIAS" "$AWK_HOST_FUNCS"'
                 function flush() { printf "%s", buf; buf = "" }
-                /^[[:space:]]*#/ { if (skip) next; buf = buf $0 "\n"; next }
-                /^[[:space:]]*$/ { if (skip) { skip = 0; buf = ""; next } buf = buf $0 "\n"; next }
                 /^[[:space:]]*[Hh]ost[[:space:]]/ {
+                    skip = 0
                     if (host_line_matches(host)) { skip = 1; buf = ""; next }
                     flush(); print; next
                 }
-                { if (skip) next; flush(); print }
+                /^[[:space:]]*[Mm]atch[[:space:]]/ { skip = 0; flush(); print; next }
+                /^[[:space:]]*#/ || /^[[:space:]]*$/ { buf = buf $0 "\n"; next }
+                { if (skip) { buf = ""; next } flush(); print }
                 END { if (!skip) flush() }
             ' "$SSH_CONFIG" > "$REMOVED"
             insert_config_entry "$REMOVED" "$TEMP_CONFIG"

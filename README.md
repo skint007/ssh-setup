@@ -307,13 +307,18 @@ Details worth knowing:
 
 - **No private key is ever copied**, so a bootstrap can't leak one machine's
   identity onto another.
-- **Server details come from your own config.** If the server has a `Host` entry
-  here, its `HostName`/`User`/`Port` are reused for the entry written on the new
-  machine, and ssh authenticates with that entry's key. Otherwise `--user`,
-  `--port` and the name you passed are used.
+- **Server details come from your own config**, resolved with `ssh -G` — the same
+  answer ssh itself would use, so wildcard blocks (`Host *.example.com`) and
+  `Match` rules count, not just exact aliases. The resolved
+  `HostName`/`User`/`Port` are what gets written on the new machine, and ssh
+  connects by name so that entry's identity, `ProxyJump`, etc. still apply.
+  Explicit values win: a spec's `user@`/`:port` first, then `--user`/`--port`,
+  then the config.
 - **The alias** is `--alias` for a single server, or the short name (first label)
   of each server in a batch. `--domain` appends a suffix to bare names, so a
-  hosts file can list `server1`, `server2`, … instead of full FQDNs.
+  hosts file can list `server1`, `server2`, … instead of full FQDNs. If two
+  servers in a batch would shorten to the same alias (`web.prod.x` and
+  `web.staging.x`), the run stops before touching anything.
 - **Idempotent.** An existing key on the new machine is reused, the
   `authorized_keys` append matches on the key's base64 material (not the whole
   line, so a different comment isn't a duplicate), and the config entry is
@@ -336,8 +341,13 @@ Details worth knowing:
 - **The new machine is reached over a control socket this run creates**, so you
   authenticate to it at most once even for a fleet of servers — password auth to
   the new machine is fine.
-- Servers still get the host-identity check before anything is written (see
-  [Behavior & safety](#behavior--safety)).
+- **Both ends get the host-identity check.** The machine being bootstrapped is
+  checked *before* any remote command runs on it — otherwise a name that resolved
+  to the wrong box could hand back a public key that then gets installed across
+  the whole fleet — and each server is checked before anything is written to it
+  (see [Behavior & safety](#behavior--safety)).
+- **The machine is checked for `ssh`, `ssh-keygen` and `awk` up front**, so a
+  missing client package can't leave keys installed on servers it can't use.
 
 Once a machine is bootstrapped, any shared key you used to get this far is
 redundant — remove it with
@@ -424,7 +434,10 @@ it won't change values you've set.
   single backup of the pre-run state.
 - **Re-running for an existing alias** prompts before replacing it. The old
   block is removed cleanly (including its leading comment) before the new one is
-  re-inserted, so the config doesn't accumulate stale or duplicate entries.
+  re-inserted, so the config doesn't accumulate stale or duplicate entries. A
+  block runs until the next `Host`/`Match` line, so blank lines and comments
+  inside a hand-formatted entry are removed with it rather than left behind —
+  while a comment run directly above the *next* block is kept.
 - **Alias matching is exact**, so glob-style aliases (e.g. `*.example.com`) and
   multi-alias `Host` lines are handled correctly.
 - **New entries are placed above a `Host *` catch-all** (rather than at the end
